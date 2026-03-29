@@ -5351,6 +5351,146 @@ size_t quantize_turbo6_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrow * row_size;
 }
 
+// =====================================================================
+// RotorQuant: Clifford Cl(3,0) rotor rotation + Lloyd-Max quantization
+// Same block layout as TurboQuant, but applies per-group rotor sandwich
+// before quantization and inverse rotor after dequantization.
+// =====================================================================
+
+static void rq_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_out,
+                               const float *centroids, int n_cent, int bits) {
+    // 1. Compute L2 norm
+    float sum2 = 0.0f;
+    for (int i = 0; i < QK_TURBO; i++) sum2 += x[i] * x[i];
+    float norm = sqrtf(sum2 + 1e-12f);
+    *norm_out = GGML_FP32_TO_FP16(norm);
+    float inv_norm = 1.0f / norm;
+
+    // 2. Normalize
+    float u[QK_TURBO];
+    for (int i = 0; i < QK_TURBO; i++) u[i] = x[i] * inv_norm;
+
+    // 3. Apply rotor rotation per group of 3, then quantize in rotated space
+    float rotated[QK_TURBO];
+    for (int g = 0; g < 21; g++) {
+        float v[3] = { u[g*3], u[g*3+1], u[g*3+2] };
+        float rv[3];
+        turbo_rotor_forward(TURBO_ROTORS_DK64[g], v, rv);
+        rotated[g*3]     = rv[0];
+        rotated[g*3 + 1] = rv[1];
+        rotated[g*3 + 2] = rv[2];
+    }
+    rotated[63] = u[63];
+
+    // 4. Quantize rotated values (indices stored in rotated space)
+    memset(qs, 0, (QK_TURBO * bits + 7) / 8);
+    int bit_offset = 0;
+    for (int i = 0; i < QK_TURBO; i++) {
+        int idx = turbo_nearest_centroid(rotated[i], centroids, n_cent);
+        int byte_pos = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+        qs[byte_pos] |= (uint8_t)((idx << bit_pos) & 0xFF);
+        if (bit_pos + bits > 8)  qs[byte_pos + 1] |= (uint8_t)(idx >> (8 - bit_pos));
+        if (bit_pos + bits > 16) qs[byte_pos + 2] |= (uint8_t)(idx >> (16 - bit_pos));
+        bit_offset += bits;
+    }
+}
+
+// Pre-rotate Q strategy: indices are stored in rotated space, dequant is simple centroid*norm
+// (Q is pre-rotated to match, so no inverse rotor needed here)
+static void rq_dequantize_block(const uint8_t *qs, ggml_half norm_h, float *y,
+                                 const float *centroids, int bits) {
+    float norm = GGML_FP16_TO_FP32(norm_h);
+
+    int bit_offset = 0;
+    for (int i = 0; i < QK_TURBO; i++) {
+        int byte_pos = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+        int idx = (qs[byte_pos] >> bit_pos);
+        if (bit_pos + bits > 8)  idx |= (qs[byte_pos + 1] << (8 - bit_pos));
+        if (bit_pos + bits > 16) idx |= (qs[byte_pos + 2] << (16 - bit_pos));
+        idx &= (1 << bits) - 1;
+        y[i] = centroids[idx] * norm;
+        bit_offset += bits;
+    }
+}
+
+// --- rq3_1: 2-bit ---
+void quantize_row_rq3_1_ref(const float * GGML_RESTRICT x, block_rq3_1 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_quantize_block(x + i*QK_TURBO, y[i].qs, &y[i].norm, TURBO_CENTROIDS_2BIT, 4, 2);
+}
+void dequantize_row_rq3_1(const block_rq3_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_dequantize_block(x[i].qs, x[i].norm, y + i*QK_TURBO, TURBO_CENTROIDS_2BIT, 2);
+}
+
+// --- rq4_1: 3-bit ---
+void quantize_row_rq4_1_ref(const float * GGML_RESTRICT x, block_rq4_1 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_quantize_block(x + i*QK_TURBO, y[i].qs, &y[i].norm, TURBO_CENTROIDS_3BIT, 8, 3);
+}
+void dequantize_row_rq4_1(const block_rq4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_dequantize_block(x[i].qs, x[i].norm, y + i*QK_TURBO, TURBO_CENTROIDS_3BIT, 3);
+}
+
+// --- rq5_1: 4-bit ---
+void quantize_row_rq5_1_ref(const float * GGML_RESTRICT x, block_rq5_1 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_quantize_block(x + i*QK_TURBO, y[i].qs, &y[i].norm, TURBO_CENTROIDS_4BIT, 16, 4);
+}
+void dequantize_row_rq5_1(const block_rq5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_dequantize_block(x[i].qs, x[i].norm, y + i*QK_TURBO, TURBO_CENTROIDS_4BIT, 4);
+}
+
+// --- rq6_1: 5-bit ---
+void quantize_row_rq6_1_ref(const float * GGML_RESTRICT x, block_rq6_1 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_quantize_block(x + i*QK_TURBO, y[i].qs, &y[i].norm, TURBO_CENTROIDS_5BIT, 32, 5);
+}
+void dequantize_row_rq6_1(const block_rq6_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    for (int64_t i = 0; i < k / QK_TURBO; i++)
+        rq_dequantize_block(x[i].qs, x[i].norm, y + i*QK_TURBO, TURBO_CENTROIDS_5BIT, 5);
+}
+
+size_t quantize_rq3_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ3_1, n_per_row);
+    quantize_row_rq3_1_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_rq4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ4_1, n_per_row);
+    quantize_row_rq4_1_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_rq5_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ5_1, n_per_row);
+    quantize_row_rq5_1_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_rq6_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_RQ6_1, n_per_row);
+    quantize_row_rq6_1_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
@@ -5592,6 +5732,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TURBO5_1:
         case GGML_TYPE_TURBO6_1:
             // turbo types: nothing special to validate beyond size checks
+            break;
+        case GGML_TYPE_RQ3_1:
+        case GGML_TYPE_RQ4_1:
+        case GGML_TYPE_RQ5_1:
+        case GGML_TYPE_RQ6_1:
+            // rotor types: nothing special to validate beyond size checks
             break;
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

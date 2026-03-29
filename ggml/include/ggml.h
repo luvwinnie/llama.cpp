@@ -428,11 +428,15 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_TURBO3_1 = 41,
-        GGML_TYPE_TURBO4_1 = 42,
-        GGML_TYPE_TURBO5_1 = 43,
-        GGML_TYPE_TURBO6_1 = 44,
-        GGML_TYPE_COUNT    = 45,
+        GGML_TYPE_TURBO3_1 = 41, // TurboQuant 2-bit dk64: Lloyd-Max (no rotation)
+        GGML_TYPE_TURBO4_1 = 42, // TurboQuant 3-bit dk64: Lloyd-Max (no rotation)
+        GGML_TYPE_TURBO5_1 = 43, // TurboQuant 4-bit dk64: Lloyd-Max (no rotation)
+        GGML_TYPE_TURBO6_1 = 44, // TurboQuant 5-bit dk64: Lloyd-Max (no rotation)
+        GGML_TYPE_RQ3_1    = 45, // RotorQuant 2-bit dk64: Clifford rotor + Lloyd-Max
+        GGML_TYPE_RQ4_1    = 46, // RotorQuant 3-bit dk64: Clifford rotor + Lloyd-Max
+        GGML_TYPE_RQ5_1    = 47, // RotorQuant 4-bit dk64: Clifford rotor + Lloyd-Max
+        GGML_TYPE_RQ6_1    = 48, // RotorQuant 5-bit dk64: Clifford rotor + Lloyd-Max
+        GGML_TYPE_COUNT    = 49,
     };
 
     // precision

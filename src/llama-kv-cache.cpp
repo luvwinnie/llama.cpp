@@ -1259,8 +1259,13 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    // Skip Hadamard rotation for RotorQuant types (they have their own Clifford rotor rotation)
+    const bool is_rq_k = (type_k() == GGML_TYPE_RQ3_1 || type_k() == GGML_TYPE_RQ4_1 ||
+                          type_k() == GGML_TYPE_RQ5_1 || type_k() == GGML_TYPE_RQ6_1);
+
     const bool can_k_rot =
         ggml_is_quantized(type_k()) &&
+        !is_rq_k &&
         !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
@@ -1285,8 +1290,12 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    const bool is_rq_v = (type_v() == GGML_TYPE_RQ3_1 || type_v() == GGML_TYPE_RQ4_1 ||
+                          type_v() == GGML_TYPE_RQ5_1 || type_v() == GGML_TYPE_RQ6_1);
+
     const bool can_v_rot =
         ggml_is_quantized(type_v()) &&
+        !is_rq_v &&
         !hparams.is_n_embd_v_gqa_variable() &&
         hparams.n_embd_head_v() % 64 == 0;
 

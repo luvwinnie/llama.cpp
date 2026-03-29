@@ -260,6 +260,16 @@ static_assert(sizeof(block_turbo5_1) == sizeof(ggml_half) + 32, "wrong turbo5_1 
 typedef struct { ggml_half norm; uint8_t qs[40]; } block_turbo6_1;
 static_assert(sizeof(block_turbo6_1) == sizeof(ggml_half) + 40, "wrong turbo6_1 block size");
 
+// RotorQuant blocks (same layout as turbo — difference is in quantize/dequantize which applies Clifford rotor rotation)
+typedef struct { ggml_half norm; uint8_t qs[16]; } block_rq3_1;
+static_assert(sizeof(block_rq3_1) == sizeof(ggml_half) + 16, "wrong rq3_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[24]; } block_rq4_1;
+static_assert(sizeof(block_rq4_1) == sizeof(ggml_half) + 24, "wrong rq4_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[32]; } block_rq5_1;
+static_assert(sizeof(block_rq5_1) == sizeof(ggml_half) + 32, "wrong rq5_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[40]; } block_rq6_1;
+static_assert(sizeof(block_rq6_1) == sizeof(ggml_half) + 40, "wrong rq6_1 block size");
+
 //
 // Ternary quantization
 //

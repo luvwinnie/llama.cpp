@@ -71,6 +71,16 @@ GGML_API void dequantize_row_turbo4_1(const block_turbo4_1 * GGML_RESTRICT x, fl
 GGML_API void dequantize_row_turbo5_1(const block_turbo5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo6_1(const block_turbo6_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// RotorQuant (Clifford rotor rotation + Lloyd-Max)
+GGML_API void dequantize_row_rq3_1(const block_rq3_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq4_1(const block_rq4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq5_1(const block_rq5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq6_1(const block_rq6_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq3_1_ref(const float * GGML_RESTRICT x, block_rq3_1 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq4_1_ref(const float * GGML_RESTRICT x, block_rq4_1 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq5_1_ref(const float * GGML_RESTRICT x, block_rq5_1 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq6_1_ref(const float * GGML_RESTRICT x, block_rq6_1 * GGML_RESTRICT y, int64_t k);
+
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -99,6 +109,10 @@ GGML_API size_t quantize_turbo3_1(const float * GGML_RESTRICT src, void * GGML_R
 GGML_API size_t quantize_turbo4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_turbo5_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_turbo6_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq3_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq4_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq5_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq6_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);

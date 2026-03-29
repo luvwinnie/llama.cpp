@@ -509,6 +509,21 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Pre-rotate Q input: holds the 64x64 block-diagonal rotation matrices for Clifford rotor
+// Used by RotorQuant (rq*_1) types to move rotation cost from K dequant to Q rotation
+// Also holds the inverse rotation matrix for un-rotating the attention output (V is stored rotated)
+class llm_graph_input_rotor_fwd : public llm_graph_input_i {
+public:
+    llm_graph_input_rotor_fwd() = default;
+    ~llm_graph_input_rotor_fwd() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rotor_fwd_matrix = nullptr; // F32 [64, 64] - forward rotation for Q
+    ggml_tensor * rotor_inv_matrix = nullptr; // F32 [64, 64] - inverse rotation for output
+};
+
 //
 // llm_graph_result
 //
@@ -674,6 +689,10 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    // cached rotor rotation matrices for rq types (created once, reused across layers)
+    ggml_tensor * t_rotor_fwd_matrix = nullptr; // forward rotation for Q pre-rotation
+    ggml_tensor * t_rotor_inv_matrix = nullptr; // inverse rotation for output un-rotation
 
     std::vector<llm_graph_input_ptr> inputs;
 

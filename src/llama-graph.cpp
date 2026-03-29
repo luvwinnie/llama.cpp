@@ -10,6 +10,12 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
+// Clifford rotor data for RotorQuant pre-rotate Q strategy
+#include "../ggml/src/ggml-turbo-rotors.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -767,6 +773,82 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+// helper: check if a ggml_type is a RotorQuant type
+static bool ggml_type_is_rq(enum ggml_type type) {
+    return type == GGML_TYPE_RQ3_1 || type == GGML_TYPE_RQ4_1 ||
+           type == GGML_TYPE_RQ5_1 || type == GGML_TYPE_RQ6_1;
+}
+
+// helper: build the 64x64 block-diagonal Clifford rotor forward rotation matrix
+// Stored as data[row*64 + col] = M[row][col] (row-major)
+// For ggml_mul_mat(A, Q): A[i0, i1] = data[i1*64 + i0] = M[i1][i0]
+// So C[i1, j] = sum_i0 A[i0,i1]*Q[i0,j] = sum_i0 M[i1][i0]*Q[i0,j] = (M*Q)[i1,j] ✓
+// 21 groups of 3x3 rotation blocks on the diagonal, plus 1x1 identity for element 63
+static void build_rotor_fwd_matrix_64x64(float * data) {
+    memset(data, 0, 64 * 64 * sizeof(float));
+
+    for (int g = 0; g < 21; g++) {
+        const float s   = TURBO_ROTORS_DK64[g][0];
+        const float b12 = TURBO_ROTORS_DK64[g][1];
+        const float b13 = TURBO_ROTORS_DK64[g][2];
+        const float b23 = TURBO_ROTORS_DK64[g][3];
+
+        const float aa = s*s, bb = b12*b12, cc = b13*b13, dd = b23*b23;
+
+        const int r = g * 3; // row/col offset
+
+        // Row 0 of the 3x3 block
+        data[(r+0)*64 + (r+0)] = aa + bb - cc - dd;
+        data[(r+0)*64 + (r+1)] = 2.0f*(b12*b13 - s*b23);
+        data[(r+0)*64 + (r+2)] = 2.0f*(b12*b23 + s*b13);
+
+        // Row 1 of the 3x3 block
+        data[(r+1)*64 + (r+0)] = 2.0f*(b12*b13 + s*b23);
+        data[(r+1)*64 + (r+1)] = aa - bb + cc - dd;
+        data[(r+1)*64 + (r+2)] = 2.0f*(b13*b23 - s*b12);
+
+        // Row 2 of the 3x3 block
+        data[(r+2)*64 + (r+0)] = 2.0f*(b12*b23 - s*b13);
+        data[(r+2)*64 + (r+1)] = 2.0f*(b13*b23 + s*b12);
+        data[(r+2)*64 + (r+2)] = aa - bb - cc + dd;
+    }
+
+    // Element 63: identity (1x1 block)
+    data[63*64 + 63] = 1.0f;
+}
+
+// helper: build the 64x64 inverse (transpose) rotation matrix
+static void build_rotor_inv_matrix_64x64(float * data) {
+    // The inverse of an orthogonal rotation matrix is its transpose
+    // So inv[row][col] = fwd[col][row]
+    float fwd[64 * 64];
+    build_rotor_fwd_matrix_64x64(fwd);
+    for (int row = 0; row < 64; row++) {
+        for (int col = 0; col < 64; col++) {
+            data[row * 64 + col] = fwd[col * 64 + row];
+        }
+    }
+}
+
+void llm_graph_input_rotor_fwd::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (rotor_fwd_matrix) {
+        float matrix_data[64 * 64];
+        build_rotor_fwd_matrix_64x64(matrix_data);
+        ggml_backend_tensor_set(rotor_fwd_matrix, matrix_data, 0, sizeof(matrix_data));
+    }
+    if (rotor_inv_matrix) {
+        float matrix_data[64 * 64];
+        build_rotor_inv_matrix_64x64(matrix_data);
+        ggml_backend_tensor_set(rotor_inv_matrix, matrix_data, 0, sizeof(matrix_data));
+    }
+}
+
+bool llm_graph_input_rotor_fwd::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return true; // rotation matrix is constant, always reusable
+}
+
 //
 // llm_graph_result
 //
@@ -792,6 +874,8 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_rotor_fwd_matrix = nullptr;
+    t_rotor_inv_matrix = nullptr;
 
     params = {};
 
@@ -1840,6 +1924,32 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    // Pre-rotate Q for RotorQuant K cache types
+    // ⟨R*q, R*k⟩ = ⟨q, k⟩ so we apply rotor_forward to Q once instead of
+    // inverse_rotor to K per-position during dequant — same result, much faster
+    // Since V is also stored in rotated space, we apply R_inverse to the output
+    const bool rq_prerotate = ggml_type_is_rq(k->type) && q->ne[0] == 64;
+    if (rq_prerotate) {
+        if (!res->t_rotor_fwd_matrix) {
+            auto inp = std::make_unique<llm_graph_input_rotor_fwd>();
+
+            inp->rotor_fwd_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 64, 64);
+            ggml_set_input(inp->rotor_fwd_matrix);
+            ggml_set_name(inp->rotor_fwd_matrix, "rotor_fwd_matrix");
+            res->t_rotor_fwd_matrix = inp->rotor_fwd_matrix;
+
+            inp->rotor_inv_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 64, 64);
+            ggml_set_input(inp->rotor_inv_matrix);
+            ggml_set_name(inp->rotor_inv_matrix, "rotor_inv_matrix");
+            res->t_rotor_inv_matrix = inp->rotor_inv_matrix;
+
+            res->add_input(std::move(inp));
+        }
+        // Q shape: [n_rot, n_head, n_tokens] — apply R_forward to dim 0 (broadcasts over higher dims)
+        q = ggml_mul_mat(ctx0, res->t_rotor_fwd_matrix, q);
+        cb(q, "q_rotor_fwd", il);
+    }
+
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1958,6 +2068,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
+    }
+
+    // Un-rotate attention output for RotorQuant: O' = R * O, so O = R_inv * O'
+    // cur shape: [n_rot*n_head, n_tokens] — reshape to [n_rot, n_head*n_tokens], apply R_inv, reshape back
+    if (rq_prerotate && res->t_rotor_inv_matrix) {
+        const int64_t n_rot_dim = 64;
+        const int64_t rest = cur->ne[0] / n_rot_dim;
+        GGML_ASSERT(cur->ne[0] == n_rot_dim * rest);
+        cur = ggml_reshape_2d(ctx0, cur, n_rot_dim, rest * cur->ne[1]);
+        cur = ggml_mul_mat(ctx0, res->t_rotor_inv_matrix, cur);
+        cb(cur, "attn_rotor_inv", il);
+        cur = ggml_reshape_2d(ctx0, cur, n_rot_dim * rest, cur->ne[1] / rest);
     }
 
     ggml_build_forward_expand(gf, cur);
