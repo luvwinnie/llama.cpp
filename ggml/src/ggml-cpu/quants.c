@@ -1231,3 +1231,105 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// ============================ TurboQuant wrappers
+
+void quantize_row_turbo3_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo3_1_ref(x, y, k);
+}
+
+void quantize_row_turbo4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo4_1_ref(x, y, k);
+}
+
+void quantize_row_turbo5_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo5_1_ref(x, y, k);
+}
+
+void quantize_row_turbo6_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo6_1_ref(x, y, k);
+}
+
+void ggml_vec_dot_turbo3_1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(nrc == 1);
+    const int nb = n / QK_TURBO;
+    float sumf = 0.0f;
+    float tmp_x[QK_TURBO];
+    float tmp_y[QK8_0];
+    const block_turbo3_1 * GGML_RESTRICT x = (const block_turbo3_1 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo3_1(&x[i], tmp_x, QK_TURBO);
+        for (int j = 0; j < 2; j++) {
+            dequantize_row_q8_0(&y[i*2+j], tmp_y, QK8_0);
+            for (int k = 0; k < QK8_0; k++) {
+                sumf += tmp_x[j*QK8_0+k] * tmp_y[k];
+            }
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_turbo4_1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(nrc == 1);
+    const int nb = n / QK_TURBO;
+    float sumf = 0.0f;
+    float tmp_x[QK_TURBO];
+    float tmp_y[QK8_0];
+    const block_turbo4_1 * GGML_RESTRICT x = (const block_turbo4_1 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo4_1(&x[i], tmp_x, QK_TURBO);
+        for (int j = 0; j < 2; j++) {
+            dequantize_row_q8_0(&y[i*2+j], tmp_y, QK8_0);
+            for (int k = 0; k < QK8_0; k++) {
+                sumf += tmp_x[j*QK8_0+k] * tmp_y[k];
+            }
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_turbo5_1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(nrc == 1);
+    const int nb = n / QK_TURBO;
+    float sumf = 0.0f;
+    float tmp_x[QK_TURBO];
+    float tmp_y[QK8_0];
+    const block_turbo5_1 * GGML_RESTRICT x = (const block_turbo5_1 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo5_1(&x[i], tmp_x, QK_TURBO);
+        for (int j = 0; j < 2; j++) {
+            dequantize_row_q8_0(&y[i*2+j], tmp_y, QK8_0);
+            for (int k = 0; k < QK8_0; k++) {
+                sumf += tmp_x[j*QK8_0+k] * tmp_y[k];
+            }
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_turbo6_1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(nrc == 1);
+    const int nb = n / QK_TURBO;
+    float sumf = 0.0f;
+    float tmp_x[QK_TURBO];
+    float tmp_y[QK8_0];
+    const block_turbo6_1 * GGML_RESTRICT x = (const block_turbo6_1 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo6_1(&x[i], tmp_x, QK_TURBO);
+        for (int j = 0; j < 2; j++) {
+            dequantize_row_q8_0(&y[i*2+j], tmp_y, QK8_0);
+            for (int k = 0; k < QK8_0; k++) {
+                sumf += tmp_x[j*QK8_0+k] * tmp_y[k];
+            }
+        }
+    }
+    *s = sumf;
+}

@@ -248,6 +248,19 @@ typedef struct {
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
 
 //
+// TurboQuant types (KV cache compression)
+//
+#define QK_TURBO 64
+typedef struct { ggml_half norm; uint8_t qs[16]; } block_turbo3_1;
+static_assert(sizeof(block_turbo3_1) == sizeof(ggml_half) + 16, "wrong turbo3_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[24]; } block_turbo4_1;
+static_assert(sizeof(block_turbo4_1) == sizeof(ggml_half) + 24, "wrong turbo4_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[32]; } block_turbo5_1;
+static_assert(sizeof(block_turbo5_1) == sizeof(ggml_half) + 32, "wrong turbo5_1 block size");
+typedef struct { ggml_half norm; uint8_t qs[40]; } block_turbo6_1;
+static_assert(sizeof(block_turbo6_1) == sizeof(ggml_half) + 40, "wrong turbo6_1 block size");
+
+//
 // Ternary quantization
 //
 
