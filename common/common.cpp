@@ -1473,8 +1473,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     // Auto-asymmetric: promote K by 1 bit for turbo3_1/turbo4_1 to fix quality
     // K needs more bits than V for attention score preservation
-    // turbo3_1(2-bit) K→turbo4_1(3-bit), turbo4_1(3-bit) K→turbo5_1(4-bit)
-    if (cparams.type_k == cparams.type_v) {
+    // Skip if TURBO_NO_ASYMMETRIC=1 or TURBO_LAYER_ADAPTIVE is set (layer-adaptive handles quality)
+    const char * no_asym_env = getenv("TURBO_NO_ASYMMETRIC");
+    const char * la_env = getenv("TURBO_LAYER_ADAPTIVE");
+    const bool skip_asymmetric = (no_asym_env && atoi(no_asym_env) > 0) || (la_env && atoi(la_env) > 0);
+    if (cparams.type_k == cparams.type_v && !skip_asymmetric) {
         if (cparams.type_k == GGML_TYPE_TURBO3_1) {
             cparams.type_k = GGML_TYPE_TURBO4_1;
             LOG_INF("%s: auto-asymmetric: K promoted to turbo4_1 (3-bit) for quality\n", __func__);
