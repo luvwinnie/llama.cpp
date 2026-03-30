@@ -6702,6 +6702,16 @@ template [[host_name("kernel_flash_attn_ext_rq4_1_dk64_dv64")]] kernel flash_att
 template [[host_name("kernel_flash_attn_ext_rq5_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_rq5_1, 4, dequantize_rq5_1, block_rq5_1, 4, dequantize_rq5_1, 64, 64>;
 template [[host_name("kernel_flash_attn_ext_rq6_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_rq6_1, 4, dequantize_rq6_1, block_rq6_1, 4, dequantize_rq6_1, 64, 64>;
 
+// Mixed K/V type flash attention kernels (auto-asymmetric: K gets 1 more bit than V)
+// turbo4_1 → K=turbo5_1, V=turbo4_1
+template [[host_name("kernel_flash_attn_ext_turbo5_1_vturbo4_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_turbo5_1, 4, dequantize_turbo5_1, block_turbo4_1, 4, dequantize_turbo4_1, 64, 64>;
+// turbo3_1 → K=turbo4_1, V=turbo3_1
+template [[host_name("kernel_flash_attn_ext_turbo4_1_vturbo3_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_turbo4_1, 4, dequantize_turbo4_1, block_turbo3_1, 4, dequantize_turbo3_1, 64, 64>;
+// rq4_1 → K=rq5_1, V=rq4_1
+template [[host_name("kernel_flash_attn_ext_rq5_1_vrq4_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_rq5_1, 4, dequantize_rq5_1, block_rq4_1, 4, dequantize_rq4_1, 64, 64>;
+// rq3_1 → K=rq4_1, V=rq3_1
+template [[host_name("kernel_flash_attn_ext_rq4_1_vrq3_1_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_rq4_1, 4, dequantize_rq4_1, block_rq3_1, 4, dequantize_rq3_1, 64, 64>;
+
 #undef FA_TYPES
 #undef FA_TYPES_BF
 #undef FA_TYPES_F32
@@ -7319,6 +7329,12 @@ template [[host_name("kernel_flash_attn_ext_vec_rq3_1_dk64_dv64")]] kernel flash
 template [[host_name("kernel_flash_attn_ext_vec_rq4_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_rq4_1, 16, dequantize_rq4_1_t4, block_rq4_1, 16, dequantize_rq4_1_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_rq5_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_rq5_1, 16, dequantize_rq5_1_t4, block_rq5_1, 16, dequantize_rq5_1_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_rq6_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_rq6_1, 16, dequantize_rq6_1_t4, block_rq6_1, 16, dequantize_rq6_1_t4, 64, 64, 2>;
+
+// Mixed K/V vec flash attention kernels (auto-asymmetric)
+template [[host_name("kernel_flash_attn_ext_vec_turbo5_1_vturbo4_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo5_1, 16, dequantize_turbo5_1_t4, block_turbo4_1, 16, dequantize_turbo4_1_t4, 64, 64, 2>;
+template [[host_name("kernel_flash_attn_ext_vec_turbo4_1_vturbo3_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_1, 16, dequantize_turbo4_1_t4, block_turbo3_1, 16, dequantize_turbo3_1_t4, 64, 64, 2>;
+template [[host_name("kernel_flash_attn_ext_vec_rq5_1_vrq4_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_rq5_1, 16, dequantize_rq5_1_t4, block_rq4_1, 16, dequantize_rq4_1_t4, 64, 64, 2>;
+template [[host_name("kernel_flash_attn_ext_vec_rq4_1_vrq3_1_dk64_dv64")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_rq4_1, 16, dequantize_rq4_1_t4, block_rq3_1, 16, dequantize_rq3_1_t4, 64, 64, 2>;
 
 #undef FA_TYPES
 #undef FA_TYPES_F32
