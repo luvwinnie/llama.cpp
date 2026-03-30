@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <math.h>
+
 #ifndef QK_TURBO
 #define QK_TURBO 64
 #endif
@@ -93,6 +95,30 @@ static inline void turbo_rotor_inverse(const float rotor[4], const float *v, flo
     out[1] = 2.0f*(b12*b13 - s*b23)*x + (aa-bb+cc-dd)*y    + 2.0f*(b13*b23 + s*b12)*z;
     out[2] = 2.0f*(b12*b23 + s*b13)*x + 2.0f*(b13*b23 - s*b12)*y + (aa-bb-cc+dd)*z;
 }
+
+// InnerQ per-channel equalization scales for dk=64
+// Identity by default (no correction). Replace with calibrated values when available.
+// Set TURBO_INNERQ=1 to enable applying these scales before quantization.
+static const float TURBO_INNERQ_SCALE_DK64[64] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+};
+static const float TURBO_INNERQ_SCALE_INV_DK64[64] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+};
 
 // Find nearest centroid index (linear search, fine for ≤32 levels)
 static inline int turbo_nearest_centroid(float val, const float *centroids, int n) {

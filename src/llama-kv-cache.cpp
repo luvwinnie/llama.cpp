@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -194,8 +195,44 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // Layer-adaptive KV cache type: promote certain layers to q8_0
+        // when using turbo/rq quantization types.
+        // TURBO_LAYER_ADAPTIVE=1: first+last 4 layers promoted
+        // TURBO_LAYER_ADAPTIVE=2: last 8 layers promoted (BEST)
+        // TURBO_LAYER_ADAPTIVE=3: last 4 layers promoted
+        static int adaptive_mode = -1;
+        if (adaptive_mode == -1) {
+            const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+            adaptive_mode = env ? atoi(env) : 0;
+        }
+
+        ggml_type layer_type_k = type_k;
+        ggml_type layer_type_v = type_v;
+
+        const bool is_turbo_k = (type_k == GGML_TYPE_TURBO3_1 || type_k == GGML_TYPE_TURBO4_1 ||
+                                 type_k == GGML_TYPE_TURBO5_1 || type_k == GGML_TYPE_TURBO6_1 ||
+                                 type_k == GGML_TYPE_RQ3_1    || type_k == GGML_TYPE_RQ4_1    ||
+                                 type_k == GGML_TYPE_RQ5_1    || type_k == GGML_TYPE_RQ6_1);
+
+        const uint32_t n_layer = hparams.n_layer;
+
+        if (is_turbo_k && adaptive_mode > 0 && n_layer >= 8) {
+            bool promote = false;
+            switch (adaptive_mode) {
+                case 1: promote = (il < 4 || il >= n_layer - 4); break;  // first+last 4
+                case 2: promote = (il >= n_layer - 8);           break;  // last 8 (BEST)
+                case 3: promote = (il >= n_layer - 4);           break;  // last 4
+            }
+            if (promote) {
+                layer_type_k = GGML_TYPE_Q8_0;
+                layer_type_v = GGML_TYPE_Q8_0;
+                LLAMA_LOG_DEBUG("%s: layer %3d: adaptive promote K/V to q8_0 (mode=%d)\n",
+                        __func__, il, adaptive_mode);
+            }
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);

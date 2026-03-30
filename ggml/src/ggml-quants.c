@@ -5187,6 +5187,15 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
 
 static void turbo_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_out,
                                   int n_elem, const float *centroids, int n_cent, int bits_per_elem) {
+    // InnerQ: apply per-channel scale before quantization if enabled
+    static bool innerq_enabled = false;
+    static bool innerq_checked = false;
+    if (!innerq_checked) {
+        const char *env = getenv("TURBO_INNERQ");
+        innerq_enabled = env && atoi(env) > 0;
+        innerq_checked = true;
+    }
+
     // Compute norm for the block
     float sum2 = 0.0f;
     for (int i = 0; i < n_elem; i++) {
@@ -5201,9 +5210,16 @@ static void turbo_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_ou
     // Pack indices into bytes
     memset(qs, 0, (n_elem * bits_per_elem + 7) / 8);
 
+    // Optionally apply InnerQ per-channel equalization
+    float u[QK_TURBO];
+    for (int i = 0; i < n_elem; i++) u[i] = x[i] * inv_norm;
+    if (innerq_enabled && n_elem == QK_TURBO) {
+        for (int i = 0; i < QK_TURBO; i++) u[i] *= TURBO_INNERQ_SCALE_DK64[i];
+    }
+
     int bit_offset = 0;
     for (int i = 0; i < n_elem; i++) {
-        float val = x[i] * inv_norm;
+        float val = u[i];
         int idx = turbo_nearest_centroid(val, centroids, n_cent);
 
         // Pack bits
@@ -5369,6 +5385,20 @@ static void rq_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_out,
     // 2. Normalize
     float u[QK_TURBO];
     for (int i = 0; i < QK_TURBO; i++) u[i] = x[i] * inv_norm;
+
+    // InnerQ: apply per-channel scale before rotation+quantization if enabled
+    {
+        static bool rq_innerq_enabled = false;
+        static bool rq_innerq_checked = false;
+        if (!rq_innerq_checked) {
+            const char *env = getenv("TURBO_INNERQ");
+            rq_innerq_enabled = env && atoi(env) > 0;
+            rq_innerq_checked = true;
+        }
+        if (rq_innerq_enabled) {
+            for (int i = 0; i < QK_TURBO; i++) u[i] *= TURBO_INNERQ_SCALE_DK64[i];
+        }
+    }
 
     // 3. Apply rotor rotation per group of 3, then quantize in rotated space
     float rotated[QK_TURBO];
