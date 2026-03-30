@@ -5217,10 +5217,15 @@ static void turbo_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_ou
         for (int i = 0; i < QK_TURBO; i++) u[i] *= TURBO_INNERQ_SCALE_DK64[i];
     }
 
+    // Quantize and compute reconstruction norm for norm correction
     int bit_offset = 0;
+    float recon_sq = 0.0f;
     for (int i = 0; i < n_elem; i++) {
         float val = u[i];
         int idx = turbo_nearest_centroid(val, centroids, n_cent);
+
+        // Track reconstruction norm
+        recon_sq += centroids[idx] * centroids[idx];
 
         // Pack bits
         int byte_pos = bit_offset / 8;
@@ -5233,6 +5238,14 @@ static void turbo_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_ou
             qs[byte_pos + 2] |= (uint8_t)(idx >> (16 - bit_pos));
         }
         bit_offset += bits_per_elem;
+    }
+
+    // Norm correction: store original_norm / reconstruction_norm
+    // so that dequant(centroid[i] * stored_norm) has ||dequant|| == ||original||
+    // This is the key fix from TheTom/turboquant_plus that makes turbo3 beat q8_0
+    float recon_norm = sqrtf(recon_sq);
+    if (recon_norm > 1e-10f) {
+        *norm_out = GGML_FP32_TO_FP16(norm / recon_norm);
     }
 }
 
@@ -5412,17 +5425,25 @@ static void rq_quantize_block(const float *x, uint8_t *qs, ggml_half *norm_out,
     }
     rotated[63] = u[63];
 
-    // 4. Quantize rotated values (indices stored in rotated space)
+    // 4. Quantize rotated values with norm correction
     memset(qs, 0, (QK_TURBO * bits + 7) / 8);
     int bit_offset = 0;
+    float recon_sq = 0.0f;
     for (int i = 0; i < QK_TURBO; i++) {
         int idx = turbo_nearest_centroid(rotated[i], centroids, n_cent);
+        recon_sq += centroids[idx] * centroids[idx];
         int byte_pos = bit_offset / 8;
         int bit_pos = bit_offset % 8;
         qs[byte_pos] |= (uint8_t)((idx << bit_pos) & 0xFF);
         if (bit_pos + bits > 8)  qs[byte_pos + 1] |= (uint8_t)(idx >> (8 - bit_pos));
         if (bit_pos + bits > 16) qs[byte_pos + 2] |= (uint8_t)(idx >> (16 - bit_pos));
         bit_offset += bits;
+    }
+
+    // Norm correction: original_norm / reconstruction_norm
+    float recon_norm = sqrtf(recon_sq);
+    if (recon_norm > 1e-10f) {
+        *norm_out = GGML_FP32_TO_FP16(norm / recon_norm);
     }
 }
 
