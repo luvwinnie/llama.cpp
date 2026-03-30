@@ -1471,6 +1471,25 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    // Auto-asymmetric: promote K by 1 bit for turbo3_1/turbo4_1 to fix quality
+    // K needs more bits than V for attention score preservation
+    // turbo3_1(2-bit) K→turbo4_1(3-bit), turbo4_1(3-bit) K→turbo5_1(4-bit)
+    if (cparams.type_k == cparams.type_v) {
+        if (cparams.type_k == GGML_TYPE_TURBO3_1) {
+            cparams.type_k = GGML_TYPE_TURBO4_1;
+            LOG_INF("%s: auto-asymmetric: K promoted to turbo4_1 (3-bit) for quality\n", __func__);
+        } else if (cparams.type_k == GGML_TYPE_TURBO4_1) {
+            cparams.type_k = GGML_TYPE_TURBO5_1;
+            LOG_INF("%s: auto-asymmetric: K promoted to turbo5_1 (4-bit) for quality\n", __func__);
+        } else if (cparams.type_k == GGML_TYPE_RQ3_1) {
+            cparams.type_k = GGML_TYPE_RQ4_1;
+            LOG_INF("%s: auto-asymmetric: K promoted to rq4_1 (3-bit) for quality\n", __func__);
+        } else if (cparams.type_k == GGML_TYPE_RQ4_1) {
+            cparams.type_k = GGML_TYPE_RQ5_1;
+            LOG_INF("%s: auto-asymmetric: K promoted to rq5_1 (4-bit) for quality\n", __func__);
+        }
+    }
+
     return cparams;
 }
 
