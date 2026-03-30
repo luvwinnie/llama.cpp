@@ -9275,11 +9275,17 @@ void quantize_turbo3_1(device const float * src, device block_turbo3_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     for (int i = 0; i < 16; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         float val = src[i] * inv_norm;
         int idx = turbo_nearest_centroid_m<4>(val, TURBO_CENTROIDS_2BIT_M);
+        recon_sq += TURBO_CENTROIDS_2BIT_M[idx] * TURBO_CENTROIDS_2BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 2, 2, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9289,11 +9295,17 @@ void quantize_turbo4_1(device const float * src, device block_turbo4_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     for (int i = 0; i < 24; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         float val = src[i] * inv_norm;
         int idx = turbo_nearest_centroid_m<8>(val, TURBO_CENTROIDS_3BIT_M);
+        recon_sq += TURBO_CENTROIDS_3BIT_M[idx] * TURBO_CENTROIDS_3BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 3, 3, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9303,11 +9315,17 @@ void quantize_turbo5_1(device const float * src, device block_turbo5_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     for (int i = 0; i < 32; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         float val = src[i] * inv_norm;
         int idx = turbo_nearest_centroid_m<16>(val, TURBO_CENTROIDS_4BIT_M);
+        recon_sq += TURBO_CENTROIDS_4BIT_M[idx] * TURBO_CENTROIDS_4BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 4, 4, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9317,11 +9335,17 @@ void quantize_turbo6_1(device const float * src, device block_turbo6_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     for (int i = 0; i < 40; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         float val = src[i] * inv_norm;
         int idx = turbo_nearest_centroid_m<32>(val, TURBO_CENTROIDS_5BIT_M);
+        recon_sq += TURBO_CENTROIDS_5BIT_M[idx] * TURBO_CENTROIDS_5BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 5, 5, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9332,6 +9356,7 @@ void quantize_rq3_1(device const float * src, device block_rq3_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     float u[64];
     for (int i = 0; i < 64; i++) u[i] = src[i] * inv_norm;
     // Apply forward rotor per group of 3
@@ -9345,7 +9370,12 @@ void quantize_rq3_1(device const float * src, device block_rq3_1 & dst) {
     for (int i = 0; i < 16; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         int idx = turbo_nearest_centroid_m<4>(rotated[i], TURBO_CENTROIDS_2BIT_M);
+        recon_sq += TURBO_CENTROIDS_2BIT_M[idx] * TURBO_CENTROIDS_2BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 2, 2, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9355,6 +9385,7 @@ void quantize_rq4_1(device const float * src, device block_rq4_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     float u[64];
     for (int i = 0; i < 64; i++) u[i] = src[i] * inv_norm;
     float rotated[64];
@@ -9367,7 +9398,12 @@ void quantize_rq4_1(device const float * src, device block_rq4_1 & dst) {
     for (int i = 0; i < 24; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         int idx = turbo_nearest_centroid_m<8>(rotated[i], TURBO_CENTROIDS_3BIT_M);
+        recon_sq += TURBO_CENTROIDS_3BIT_M[idx] * TURBO_CENTROIDS_3BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 3, 3, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9377,6 +9413,7 @@ void quantize_rq5_1(device const float * src, device block_rq5_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     float u[64];
     for (int i = 0; i < 64; i++) u[i] = src[i] * inv_norm;
     float rotated[64];
@@ -9389,7 +9426,12 @@ void quantize_rq5_1(device const float * src, device block_rq5_1 & dst) {
     for (int i = 0; i < 32; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         int idx = turbo_nearest_centroid_m<16>(rotated[i], TURBO_CENTROIDS_4BIT_M);
+        recon_sq += TURBO_CENTROIDS_4BIT_M[idx] * TURBO_CENTROIDS_4BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 4, 4, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
@@ -9399,6 +9441,7 @@ void quantize_rq6_1(device const float * src, device block_rq6_1 & dst) {
     float norm = sqrt(sum2 + 1e-12f);
     dst.norm = half(norm);
     float inv_norm = 1.0f / norm;
+    float recon_sq = 0.0f;
     float u[64];
     for (int i = 0; i < 64; i++) u[i] = src[i] * inv_norm;
     float rotated[64];
@@ -9411,7 +9454,12 @@ void quantize_rq6_1(device const float * src, device block_rq6_1 & dst) {
     for (int i = 0; i < 40; i++) dst.qs[i] = 0;
     for (int i = 0; i < 64; i++) {
         int idx = turbo_nearest_centroid_m<32>(rotated[i], TURBO_CENTROIDS_5BIT_M);
+        recon_sq += TURBO_CENTROIDS_5BIT_M[idx] * TURBO_CENTROIDS_5BIT_M[idx];
         turbo_pack_bits(dst.qs, i * 5, 5, idx);
+    }
+    float recon_norm = sqrt(recon_sq);
+    if (recon_norm > 1e-10f) {
+        dst.norm = half(norm / recon_norm);
     }
 }
 
