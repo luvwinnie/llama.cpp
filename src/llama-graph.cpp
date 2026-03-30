@@ -1928,8 +1928,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // ⟨R*q, R*k⟩ = ⟨q, k⟩ so we apply rotor_forward to Q once instead of
     // inverse_rotor to K per-position during dequant — same result, much faster
     // Since V is also stored in rotated space, we apply R_inverse to the output
-    const bool rq_prerotate = ggml_type_is_rq(k->type) && q->ne[0] == 64;
-    if (rq_prerotate) {
+    const bool rq_k = ggml_type_is_rq(k->type) && q->ne[0] == 64;
+    const bool rq_v = ggml_type_is_rq(v->type) && q->ne[0] == 64;
+    const bool rq_prerotate = rq_k; // pre-rotate Q when K is rq
+    const bool rq_unrotate_output = rq_k || rq_v; // un-rotate output when K or V is rq
+    if (rq_prerotate || rq_unrotate_output) {
         if (!res->t_rotor_fwd_matrix) {
             auto inp = std::make_unique<llm_graph_input_rotor_fwd>();
 
@@ -2072,7 +2075,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // Un-rotate attention output for RotorQuant: O' = R * O, so O = R_inv * O'
     // cur shape: [n_rot*n_head, n_tokens] — reshape to [n_rot, n_head*n_tokens], apply R_inv, reshape back
-    if (rq_prerotate && res->t_rotor_inv_matrix) {
+    if (rq_unrotate_output && res->t_rotor_inv_matrix) {
         const int64_t n_rot_dim = 64;
         const int64_t rest = cur->ne[0] / n_rot_dim;
         GGML_ASSERT(cur->ne[0] == n_rot_dim * rest);

@@ -7004,6 +7004,11 @@ kernel void kernel_flash_attn_ext_vec(
 
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
+            // sparse V: skip V dequant+accumulation if all attention weights are negligible
+            if (simd_max(float(ss[tiisg])) < 1e-6f) {
+                continue;
+            }
+
             // O = O + (Q*K^T)*V
             {
                 o4_t lo[DV4/NL];
