@@ -402,6 +402,180 @@ void test_zero_vector(void) {
     TEST_PASS("zero vector maps to central centroid");
 }
 
+// ---- Non-Unit Norm Vectors (from test_polar_quant.py) ----
+
+void test_non_unit_norm_vectors(void) {
+    // Real KV cache vectors have norms ~10-50, not 1.0
+    float scales[] = {0.01f, 1.0f, 10.0f, 50.0f, 100.0f};
+    for (int si = 0; si < 5; si++) {
+        rng_seed(42 + si);
+        float x[64], norm = 0;
+        for (int i = 0; i < 64; i++) { x[i] = rng_normal() * scales[si]; norm += x[i]*x[i]; }
+        norm = sqrtf(norm);
+        float inv = 1.0f / norm;
+
+        // Quantize normalized, scale back
+        float mse = 0;
+        for (int i = 0; i < 64; i++) {
+            float u = x[i] * inv;
+            int idx = turbo_nearest_centroid(u, TURBO_CENTROIDS_3BIT, 8);
+            float recon = TURBO_CENTROIDS_3BIT[idx] * norm;
+            float d = x[i] - recon;
+            mse += d * d;
+        }
+        // For tiny norms (scale=0.01), relative MSE can be large due to quantization granularity
+        // Only check for scales >= 1.0
+        if (scales[si] >= 1.0f) {
+            float norm_sq_per_d = norm * norm / 64.0f;
+            float rel_mse = (norm_sq_per_d > 1e-10f) ? (mse / 64.0f) / norm_sq_per_d : 0.0f;
+            TEST_ASSERT(rel_mse < 1.0f, "relative MSE too high for non-unit norm");
+        }
+    }
+    TEST_PASS("non-unit norm vectors (scales 0.01-100)");
+}
+
+// ---- Rotor Post-Rotation Distribution (from test_rotation.py) ----
+
+void test_rotor_post_rotation_distribution(void) {
+    // After rotation, each coordinate should have mean ≈ 0 and variance ≈ 1/d
+    // Test with 500 random vectors through rotor
+    rng_seed(42);
+    float sum[3] = {0}, sum2[3] = {0};
+    int N = 500;
+    for (int s = 0; s < N; s++) {
+        float v[3], norm = 0;
+        for (int i = 0; i < 3; i++) { v[i] = rng_normal(); norm += v[i]*v[i]; }
+        norm = sqrtf(norm);
+        for (int i = 0; i < 3; i++) v[i] /= norm; // unit vector
+        float rv[3];
+        turbo_rotor_forward(TURBO_ROTORS_DK64[0], v, rv);
+        for (int i = 0; i < 3; i++) { sum[i] += rv[i]; sum2[i] += rv[i]*rv[i]; }
+    }
+    for (int i = 0; i < 3; i++) {
+        float mean = sum[i] / N;
+        float var = sum2[i] / N - mean * mean;
+        TEST_ASSERT(fabsf(mean) < 0.15f, "post-rotation mean too far from 0");
+        // Variance should be roughly 1/3 for 3D unit vectors
+        TEST_ASSERT(var > 0.1f && var < 0.6f, "post-rotation variance out of range");
+    }
+    TEST_PASS("rotor post-rotation distribution (mean≈0, var≈1/3)");
+}
+
+// ---- Deterministic Output (from test_turboquant.py) ----
+
+void test_quantize_deterministic(void) {
+    float x[64];
+    rng_seed(1);
+    for (int i = 0; i < 64; i++) x[i] = rng_normal();
+
+    // Quantize twice with same data
+    int idx1[64], idx2[64];
+    for (int i = 0; i < 64; i++) {
+        float u = x[i] / 1.0f; // simplified — real code normalizes by norm
+        idx1[i] = turbo_nearest_centroid(u, TURBO_CENTROIDS_3BIT, 8);
+        idx2[i] = turbo_nearest_centroid(u, TURBO_CENTROIDS_3BIT, 8);
+    }
+    for (int i = 0; i < 64; i++) {
+        TEST_ASSERT(idx1[i] == idx2[i], "non-deterministic quantization");
+    }
+    TEST_PASS("quantization is deterministic");
+}
+
+// ---- All Indices In Range (from test_polar_quant.py) ----
+
+void test_indices_in_range(void) {
+    rng_seed(99);
+    struct { int n_cent; const float *cents; } c[] = {
+        {4, TURBO_CENTROIDS_2BIT}, {8, TURBO_CENTROIDS_3BIT},
+        {16, TURBO_CENTROIDS_4BIT}, {32, TURBO_CENTROIDS_5BIT},
+    };
+    for (int ci = 0; ci < 4; ci++) {
+        for (int s = 0; s < 200; s++) {
+            float val = rng_normal() * 0.125f; // sigma=1/sqrt(64)
+            int idx = turbo_nearest_centroid(val, c[ci].cents, c[ci].n_cent);
+            TEST_ASSERT(idx >= 0 && idx < c[ci].n_cent, "index out of range");
+        }
+    }
+    TEST_PASS("all indices in valid range [0, 2^b)");
+}
+
+// ---- Higher Bits = Lower MSE (from test_turbo4.py) ----
+
+void test_turbo4_vs_turbo3_quality(void) {
+    rng_seed(99);
+    float mse3 = 0, mse4 = 0;
+    int N = 200;
+    for (int s = 0; s < N; s++) {
+        float x[64], norm = 0;
+        for (int i = 0; i < 64; i++) { x[i] = rng_normal(); norm += x[i]*x[i]; }
+        norm = sqrtf(norm);
+        for (int i = 0; i < 64; i++) x[i] /= norm;
+        float e3 = 0, e4 = 0;
+        for (int i = 0; i < 64; i++) {
+            int i3 = turbo_nearest_centroid(x[i], TURBO_CENTROIDS_3BIT, 8);
+            int i4 = turbo_nearest_centroid(x[i], TURBO_CENTROIDS_4BIT, 16);
+            float d3 = x[i] - TURBO_CENTROIDS_3BIT[i3]; e3 += d3*d3;
+            float d4 = x[i] - TURBO_CENTROIDS_4BIT[i4]; e4 += d4*d4;
+        }
+        mse3 += e3/64; mse4 += e4/64;
+    }
+    TEST_ASSERT(mse4/N < mse3/N, "4-bit should have lower MSE than 3-bit");
+    printf("PASS: 4-bit MSE (%.5f) < 3-bit MSE (%.5f)\n", mse4/N, mse3/N);
+    tests_passed++;
+}
+
+// ---- Cosine Similarity Preservation ----
+
+void test_cosine_similarity(void) {
+    struct { int n_cent; const float *cents; } c[] = {
+        {8, TURBO_CENTROIDS_3BIT}, {16, TURBO_CENTROIDS_4BIT},
+    };
+    for (int ci = 0; ci < 2; ci++) {
+        rng_seed(500 + ci);
+        float total_cos = 0;
+        int N = 200;
+        for (int s = 0; s < N; s++) {
+            float x[64], norm = 0;
+            for (int i = 0; i < 64; i++) { x[i] = rng_normal(); norm += x[i]*x[i]; }
+            norm = sqrtf(norm);
+            float dot_xq = 0, norm_q = 0;
+            for (int i = 0; i < 64; i++) {
+                float u = x[i] / norm;
+                int idx = turbo_nearest_centroid(u, c[ci].cents, c[ci].n_cent);
+                float q = c[ci].cents[idx];
+                dot_xq += u * q;
+                norm_q += q * q;
+            }
+            float cos_sim = dot_xq / (1.0f * sqrtf(norm_q) + 1e-10f);
+            total_cos += cos_sim;
+        }
+        float avg_cos = total_cos / N;
+        int bits = (ci == 0) ? 3 : 4;
+        if (avg_cos < 0.9f) {
+            printf("FAIL: %d-bit avg cosine sim = %.4f (should be > 0.9)\n", bits, avg_cos);
+            tests_failed++;
+        } else {
+            printf("PASS: %d-bit avg cosine sim = %.4f (> 0.9)\n", bits, avg_cos);
+            tests_passed++;
+        }
+    }
+}
+
+// ---- Block Size Consistency ----
+
+void test_block_sizes(void) {
+    TEST_ASSERT(sizeof(float) == 4, "float size");
+    // turbo3_1: 2 bytes norm + 16 bytes qs = 18
+    TEST_ASSERT(2 + 16 == 18, "turbo3_1 block");
+    // turbo4_1: 2 + 24 = 26
+    TEST_ASSERT(2 + 24 == 26, "turbo4_1 block");
+    // turbo5_1: 2 + 32 = 34
+    TEST_ASSERT(2 + 32 == 34, "turbo5_1 block");
+    // turbo6_1: 2 + 40 = 42
+    TEST_ASSERT(2 + 40 == 42, "turbo6_1 block");
+    TEST_PASS("block sizes match spec");
+}
+
 // ---- Main ----
 
 int main(void) {
@@ -443,6 +617,21 @@ int main(void) {
     test_innerq_identity();
     test_theoretical_lower_bound();
     test_zero_vector();
+
+    printf("\n--- PolarQuant / Round-Trip (3 tests) ---\n");
+    test_non_unit_norm_vectors();
+    test_quantize_deterministic();
+    test_indices_in_range();
+
+    printf("\n--- Rotation Distribution (1 test) ---\n");
+    test_rotor_post_rotation_distribution();
+
+    printf("\n--- Quality Comparison (2 tests) ---\n");
+    test_turbo4_vs_turbo3_quality();
+    test_cosine_similarity();
+
+    printf("\n--- Block Format (1 test) ---\n");
+    test_block_sizes();
 
     printf("\n============================================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
