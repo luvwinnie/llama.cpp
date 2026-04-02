@@ -344,6 +344,10 @@ ggml_cgraph * clip_graph_gemma4a::build() {
 
     cur = build_mm(model.pre_encode_out_w, cur);
     cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
+    // embed_audio: RMSNorm (no weight) → Linear
+    // HF applies Gemma4RMSNorm(with_scale=False) before projection
+    // Disabled for now — reduces quality, suggests conformer output stats are off
+    // TODO: fix conformer to produce correct output magnitude, then enable
     cur = build_mm(model.mm_audio_inp_proj_w, cur);
     cb(cur, "projected", -1);
 
