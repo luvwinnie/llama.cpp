@@ -2832,8 +2832,13 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
             } break;
         case PROJECTOR_TYPE_GEMMA4A:
             {
-                // 2 conv layers with stride 2 each: T -> T/2 -> T/4
-                n_patches = ((img->nx + 1) / 2 + 1) / 2;
+                // 2 conv2d layers with stride=2, pad=1, kernel=3:
+                // out = (in + 2*pad - kernel) / stride + 1 = (in - 1) / 2 + 1
+                // Time axis: img->nx = n_frames → after transpose becomes dim1 (H in ggml)
+                int64_t t = img->nx; // n_frames
+                t = (t + 2 - 3) / 2 + 1; // conv0 on H
+                t = (t + 2 - 3) / 2 + 1; // conv1 on H
+                n_patches = t;
             } break;
         default:
             GGML_ABORT("unsupported projector type");
@@ -3311,6 +3316,18 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                         }
                     }
                     set_input_f32("audio_attn_mask", mask);
+                }
+
+                // 3. Toeplitz diagonal masks: 13 matrices [seq, seq]
+                // diag_mask_d[i, j] = 1.0 if j == i - d, else 0.0
+                for (int d = 0; d < 13; d++) {
+                    std::vector<float> diag(n_tokens * n_tokens, 0.0f);
+                    for (int i = d; i < n_tokens; i++) {
+                        diag[i * n_tokens + (i - d)] = 1.0f;
+                    }
+                    char name[64];
+                    snprintf(name, sizeof(name), "audio_diag_%d", d);
+                    set_input_f32(name, diag);
                 }
             } break;
         default:
