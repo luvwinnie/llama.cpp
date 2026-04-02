@@ -50,7 +50,7 @@ ggml_cgraph * clip_graph_gemma4a::build() {
 
     const int64_t S = cur->ne[1]; // seq_len
 
-    // Input: position embeddings [hidden, 13]
+    // Input: relative position embeddings [hidden, 13]
     ggml_tensor * pos_emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N_REL_POS);
     ggml_set_name(pos_emb, "audio_pos_emb");
     ggml_set_input(pos_emb);
