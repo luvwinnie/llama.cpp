@@ -212,7 +212,9 @@ llama_kv_cache::llama_kv_cache(
         const bool is_turbo_k = (type_k == GGML_TYPE_TURBO3_1 || type_k == GGML_TYPE_TURBO4_1 ||
                                  type_k == GGML_TYPE_TURBO5_1 || type_k == GGML_TYPE_TURBO6_1 ||
                                  type_k == GGML_TYPE_RQ3_1    || type_k == GGML_TYPE_RQ4_1    ||
-                                 type_k == GGML_TYPE_RQ5_1    || type_k == GGML_TYPE_RQ6_1);
+                                 type_k == GGML_TYPE_RQ5_1    || type_k == GGML_TYPE_RQ6_1    ||
+                                 type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO2_0 ||
+                                 type_k == GGML_TYPE_TURBO4_0);
 
         const uint32_t n_layer = hparams.n_layer;
 
@@ -1296,7 +1298,11 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    // Skip Hadamard rotation for RotorQuant types (they have their own Clifford rotor rotation)
+    // Skip Hadamard rotation for RotorQuant types (they have their own Clifford rotation)
+    // turbo2_0/turbo3_0 USE Hadamard rotation — their set_rows WHT provides the rotation,
+    // but we still need Q to be rotated for correct attention dot products.
+    // The Hadamard from PR #21038 handles Q rotation; set_rows WHT handles K/V rotation.
+    // Both use the same randomized Hadamard basis, so <H*q, H*k> = <q, k>.
     const bool is_rq_k = (type_k() == GGML_TYPE_RQ3_1 || type_k() == GGML_TYPE_RQ4_1 ||
                           type_k() == GGML_TYPE_RQ5_1 || type_k() == GGML_TYPE_RQ6_1);
 

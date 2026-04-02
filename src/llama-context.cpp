@@ -2933,6 +2933,8 @@ llama_context * llama_init_from_model(
             case GGML_TYPE_RQ4_1:
             case GGML_TYPE_RQ5_1:
             case GGML_TYPE_RQ6_1:
+            case GGML_TYPE_TURBO3_0:
+            case GGML_TYPE_TURBO2_0:
                 return true;
             default:
                 return false;
@@ -2962,8 +2964,14 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
-            if (is_turbo_or_rq_type(params.type_k) && model->hparams.n_embd_head_k(il) != 64) {
-                LLAMA_LOG_ERROR("%s: K cache type %s currently supports only n_embd_head_k=64, got %u at layer %u\n",
+            if (is_turbo_or_rq_type(params.type_k) && model->hparams.n_embd_head_k(il) % 64 != 0) {
+                LLAMA_LOG_ERROR("%s: K cache type %s requires n_embd_head_k to be a multiple of 64, got %u at layer %u\n",
+                    __func__, ggml_type_name(params.type_k), model->hparams.n_embd_head_k(il), il);
+                return nullptr;
+            }
+            if ((params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO2_0) &&
+                model->hparams.n_embd_head_k(il) < 128) {
+                LLAMA_LOG_ERROR("%s: K cache type %s requires n_embd_head_k >= 128 (WHT group size), got %u at layer %u\n",
                     __func__, ggml_type_name(params.type_k), model->hparams.n_embd_head_k(il), il);
                 return nullptr;
             }
@@ -2978,8 +2986,14 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
-            if (is_turbo_or_rq_type(params.type_v) && model->hparams.n_embd_head_v(il) != 64) {
-                LLAMA_LOG_ERROR("%s: V cache type %s currently supports only n_embd_head_v=64, got %u at layer %u\n",
+            if (is_turbo_or_rq_type(params.type_v) && model->hparams.n_embd_head_v(il) % 64 != 0) {
+                LLAMA_LOG_ERROR("%s: V cache type %s requires n_embd_head_v to be a multiple of 64, got %u at layer %u\n",
+                    __func__, ggml_type_name(params.type_v), model->hparams.n_embd_head_v(il), il);
+                return nullptr;
+            }
+            if ((params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO2_0) &&
+                model->hparams.n_embd_head_v(il) < 128) {
+                LLAMA_LOG_ERROR("%s: V cache type %s requires n_embd_head_v >= 128 (WHT group size), got %u at layer %u\n",
                     __func__, ggml_type_name(params.type_v), model->hparams.n_embd_head_v(il), il);
                 return nullptr;
             }

@@ -270,6 +270,33 @@ static_assert(sizeof(block_rq5_1) == sizeof(ggml_half) + 32, "wrong rq5_1 block 
 typedef struct { ggml_half norm; uint8_t qs[40]; } block_rq6_1;
 static_assert(sizeof(block_rq6_1) == sizeof(ggml_half) + 40, "wrong rq6_1 block size");
 
+// TurboQuant WHT-rotated types (block size 32, rotation group 128)
+#define QK_TURBO3_0 32
+#define QK_TURBO3_0_GROUP 128
+typedef struct {
+    ggml_half norm;
+    uint8_t qs[QK_TURBO3_0 / 4];     // 8 bytes: lower 2-bit
+    uint8_t signs[QK_TURBO3_0 / 8];  // 4 bytes: upper 1-bit
+} block_turbo3_0;  // 14 bytes
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3_0/4 + QK_TURBO3_0/8, "wrong turbo3_0 block size");
+
+#define QK_TURBO2_0 32
+#define QK_TURBO2_0_GROUP 128
+typedef struct {
+    ggml_half norm;
+    uint8_t qs[QK_TURBO2_0 / 4];  // 8 bytes: 2-bit indices
+} block_turbo2_0;  // 10 bytes
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2_0/4, "wrong turbo2_0 block size");
+
+// TurboQuant 4-bit WHT-rotated (pure PolarQuant, 16 centroids, no QJL)
+#define QK_TURBO4_0 32
+#define QK_TURBO4_0_GROUP 128
+typedef struct {
+    ggml_half norm;
+    uint8_t qs[QK_TURBO4_0 / 2];  // 16 bytes: 4-bit indices packed 2 per byte
+} block_turbo4_0;  // 18 bytes
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO4_0/2, "wrong turbo4_0 block size");
+
 //
 // Ternary quantization
 //

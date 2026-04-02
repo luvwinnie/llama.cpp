@@ -830,17 +830,60 @@ static void build_rotor_inv_matrix_64x64(float * data) {
     }
 }
 
+// helper: build NxN block-diagonal rotor matrix for arbitrary multiples of 64
+// For dk128: two copies of the 64x64 rotor matrix along the diagonal
+static void build_rotor_fwd_matrix(float * data, int dim) {
+    GGML_ASSERT(dim % 64 == 0);
+    memset(data, 0, dim * dim * sizeof(float));
+    const int n_copies = dim / 64;
+    for (int c = 0; c < n_copies; c++) {
+        const int base = c * 64;
+        for (int g = 0; g < 21; g++) {
+            const float s   = TURBO_ROTORS_DK64[g][0];
+            const float b12 = TURBO_ROTORS_DK64[g][1];
+            const float b13 = TURBO_ROTORS_DK64[g][2];
+            const float b23 = TURBO_ROTORS_DK64[g][3];
+            const float aa = s*s, bb = b12*b12, cc = b13*b13, dd = b23*b23;
+            const int r = base + g * 3;
+            data[(r+0)*dim + (r+0)] = aa + bb - cc - dd;
+            data[(r+0)*dim + (r+1)] = 2.0f*(b12*b13 - s*b23);
+            data[(r+0)*dim + (r+2)] = 2.0f*(b12*b23 + s*b13);
+            data[(r+1)*dim + (r+0)] = 2.0f*(b12*b13 + s*b23);
+            data[(r+1)*dim + (r+1)] = aa - bb + cc - dd;
+            data[(r+1)*dim + (r+2)] = 2.0f*(b13*b23 - s*b12);
+            data[(r+2)*dim + (r+0)] = 2.0f*(b12*b23 - s*b13);
+            data[(r+2)*dim + (r+1)] = 2.0f*(b13*b23 + s*b12);
+            data[(r+2)*dim + (r+2)] = aa - bb - cc + dd;
+        }
+        // Element 63 of each 64-block: identity
+        data[(base + 63)*dim + (base + 63)] = 1.0f;
+    }
+}
+
+static void build_rotor_inv_matrix(float * data, int dim) {
+    GGML_ASSERT(dim % 64 == 0);
+    std::vector<float> fwd(dim * dim);
+    build_rotor_fwd_matrix(fwd.data(), dim);
+    for (int row = 0; row < dim; row++) {
+        for (int col = 0; col < dim; col++) {
+            data[row * dim + col] = fwd[col * dim + row];
+        }
+    }
+}
+
 void llm_graph_input_rotor_fwd::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     if (rotor_fwd_matrix) {
-        float matrix_data[64 * 64];
-        build_rotor_fwd_matrix_64x64(matrix_data);
-        ggml_backend_tensor_set(rotor_fwd_matrix, matrix_data, 0, sizeof(matrix_data));
+        const int dim = rotor_fwd_matrix->ne[0];
+        std::vector<float> matrix_data(dim * dim);
+        build_rotor_fwd_matrix(matrix_data.data(), dim);
+        ggml_backend_tensor_set(rotor_fwd_matrix, matrix_data.data(), 0, dim * dim * sizeof(float));
     }
     if (rotor_inv_matrix) {
-        float matrix_data[64 * 64];
-        build_rotor_inv_matrix_64x64(matrix_data);
-        ggml_backend_tensor_set(rotor_inv_matrix, matrix_data, 0, sizeof(matrix_data));
+        const int dim = rotor_inv_matrix->ne[0];
+        std::vector<float> matrix_data(dim * dim);
+        build_rotor_inv_matrix(matrix_data.data(), dim);
+        ggml_backend_tensor_set(rotor_inv_matrix, matrix_data.data(), 0, dim * dim * sizeof(float));
     }
 }
 
@@ -1928,20 +1971,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // ⟨R*q, R*k⟩ = ⟨q, k⟩ so we apply rotor_forward to Q once instead of
     // inverse_rotor to K per-position during dequant — same result, much faster
     // Since V is also stored in rotated space, we apply R_inverse to the output
-    const bool rq_k = ggml_type_is_rq(k->type) && q->ne[0] == 64;
-    const bool rq_v = ggml_type_is_rq(v->type) && q->ne[0] == 64;
+    const int64_t head_dim = q->ne[0];
+    const bool rq_k = ggml_type_is_rq(k->type) && head_dim % 64 == 0;
+    const bool rq_v = ggml_type_is_rq(v->type) && head_dim % 64 == 0;
     const bool rq_prerotate = rq_k; // pre-rotate Q when K is rq
     const bool rq_unrotate_output = rq_k || rq_v; // un-rotate output when K or V is rq
     if (rq_prerotate || rq_unrotate_output) {
         if (!res->t_rotor_fwd_matrix) {
             auto inp = std::make_unique<llm_graph_input_rotor_fwd>();
 
-            inp->rotor_fwd_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 64, 64);
+            inp->rotor_fwd_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, head_dim, head_dim);
             ggml_set_input(inp->rotor_fwd_matrix);
             ggml_set_name(inp->rotor_fwd_matrix, "rotor_fwd_matrix");
             res->t_rotor_fwd_matrix = inp->rotor_fwd_matrix;
 
-            inp->rotor_inv_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 64, 64);
+            inp->rotor_inv_matrix = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, head_dim, head_dim);
             ggml_set_input(inp->rotor_inv_matrix);
             ggml_set_name(inp->rotor_inv_matrix, "rotor_inv_matrix");
             res->t_rotor_inv_matrix = inp->rotor_inv_matrix;
@@ -2076,7 +2120,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // Un-rotate attention output for RotorQuant: O' = R * O, so O = R_inv * O'
     // cur shape: [n_rot*n_head, n_tokens] — reshape to [n_rot, n_head*n_tokens], apply R_inv, reshape back
     if (rq_unrotate_output && res->t_rotor_inv_matrix) {
-        const int64_t n_rot_dim = 64;
+        const int64_t n_rot_dim = res->t_rotor_inv_matrix->ne[0]; // 64 or 128
         const int64_t rest = cur->ne[0] / n_rot_dim;
         GGML_ASSERT(cur->ne[0] == n_rot_dim * rest);
         cur = ggml_reshape_2d(ctx0, cur, n_rot_dim, rest * cur->ne[1]);

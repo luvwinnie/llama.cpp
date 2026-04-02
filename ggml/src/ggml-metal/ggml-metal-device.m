@@ -1157,10 +1157,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                // Allow mixed turbo/rq types (auto-asymmetric K/V)
-                const bool k_is_turbo = (op->src[1]->type >= GGML_TYPE_TURBO3_1 && op->src[1]->type <= GGML_TYPE_RQ6_1);
-                const bool v_is_turbo = (op->src[2]->type >= GGML_TYPE_TURBO3_1 && op->src[2]->type <= GGML_TYPE_RQ6_1);
-                if (!(k_is_turbo && v_is_turbo)) {
+                // Only allow cross-type combos that have FA kernel instantiations
+                const enum ggml_type tk = op->src[1]->type;
+                const enum ggml_type tv = op->src[2]->type;
+                const bool valid_cross =
+                    (tk == GGML_TYPE_TURBO5_1 && tv == GGML_TYPE_TURBO4_1) ||
+                    (tk == GGML_TYPE_TURBO4_1 && tv == GGML_TYPE_TURBO3_1) ||
+                    (tk == GGML_TYPE_RQ5_1    && tv == GGML_TYPE_RQ4_1)    ||
+                    (tk == GGML_TYPE_RQ4_1    && tv == GGML_TYPE_RQ3_1)    ||
+                    (tk == GGML_TYPE_TURBO3_0 && tv == GGML_TYPE_TURBO2_0) ||
+                    (tk == GGML_TYPE_TURBO2_0 && tv == GGML_TYPE_TURBO3_0);
+                if (!valid_cross) {
                     return false;
                 }
             }
@@ -1259,6 +1266,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_RQ4_1:
                     case GGML_TYPE_RQ5_1:
                     case GGML_TYPE_RQ6_1:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         return false;

@@ -5542,6 +5542,343 @@ size_t quantize_rq6_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+// ---------- TurboQuant WHT-rotated types (turbo3_0, turbo2_0) ----------
+
+// WHT sign arrays (must match Metal, seed=42)
+static const float turbo_cpu_s1[128] = {
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1
+};
+static const float turbo_cpu_s2[128] = {
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1
+};
+
+// CPU forward WHT (in-place, 128 elements)
+static void turbo_cpu_fwht(float * x, int group_size) {
+    // signs1
+    for (int i = 0; i < group_size; i++) x[i] *= turbo_cpu_s1[i];
+    // butterfly stages
+    for (int h = 1; h < group_size; h *= 2) {
+        for (int i = 0; i < group_size; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    // normalize + signs2
+    const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
+    for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * turbo_cpu_s2[i];
+}
+
+// Centroids
+static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
+static const float CENTROIDS_3BIT[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+static int nearest_centroid_2bit(float val) {
+    if (val < -0.086728f) return 0;
+    if (val <  0.000000f) return 1;
+    if (val <  0.086728f) return 2;
+    return 3;
+}
+
+static int nearest_centroid_3bit(float val) {
+    if (val < -0.154259f) return 0;
+    if (val < -0.091775f) return 1;
+    if (val < -0.043589f) return 2;
+    if (val <  0.000000f) return 3;
+    if (val <  0.043589f) return 4;
+    if (val <  0.091775f) return 5;
+    if (val <  0.154259f) return 6;
+    return 7;
+}
+
+// Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler)
+int turbo3_cpu_wht_group_size = 0;
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3_0 == 0);
+
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
+
+    const int n_groups = k / group_size;
+    const int blocks_per_group = group_size / QK_TURBO3_0;
+
+    for (int g = 0; g < n_groups; g++) {
+        const float * grp_src = x + g * group_size;
+        block_turbo3_0 * grp_dst = y + g * blocks_per_group;
+
+        float norm_sq = 0.0f;
+        float buf[128];
+        for (int j = 0; j < group_size; j++) {
+            buf[j] = grp_src[j];
+            norm_sq += buf[j] * buf[j];
+        }
+        float grp_norm = sqrtf(norm_sq);
+        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
+        turbo_cpu_fwht(buf, group_size);
+
+        float recon_sq = 0.0f;
+        for (int b = 0; b < blocks_per_group; b++) {
+            block_turbo3_0 * blk = &grp_dst[b];
+            const int off = b * QK_TURBO3_0;
+
+            memset(blk->qs, 0, QK_TURBO3_0 / 4);
+            memset(blk->signs, 0, QK_TURBO3_0 / 8);
+
+            for (int j = 0; j < QK_TURBO3_0; j++) {
+                int idx = nearest_centroid_3bit(buf[off + j]);
+                blk->qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+                if (idx & 0x4) {
+                    blk->signs[j / 8] |= (1 << (j % 8));
+                }
+                recon_sq += CENTROIDS_3BIT[idx] * CENTROIDS_3BIT[idx];
+            }
+        }
+
+        float recon_norm = sqrtf(recon_sq);
+        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        for (int b = 0; b < blocks_per_group; b++) {
+            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
+        }
+    }
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3_0 == 0);
+    const int nb = k / QK_TURBO3_0;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO3_0; j++) {
+            uint8_t low2 = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
+            uint8_t hi1 = (x[block].signs[j/8] >> (j%8)) & 0x1;
+            uint8_t idx = low2 | (hi1 << 2);
+            y[block * QK_TURBO3_0 + j] = CENTROIDS_3BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix;
+    assert(n_per_row % QK_TURBO3_0 == 0);
+    size_t row_size = (n_per_row / QK_TURBO3_0) * sizeof(block_turbo3_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo3_0_ref(
+            src + row * n_per_row,
+            (block_turbo3_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2_0 == 0);
+
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
+
+    const int n_groups = k / group_size;
+    const int blocks_per_group = group_size / QK_TURBO2_0;
+
+    for (int g = 0; g < n_groups; g++) {
+        const float * grp_src = x + g * group_size;
+        block_turbo2_0 * grp_dst = y + g * blocks_per_group;
+
+        float norm_sq = 0.0f;
+        float buf[128];
+        for (int j = 0; j < group_size; j++) {
+            buf[j] = grp_src[j];
+            norm_sq += buf[j] * buf[j];
+        }
+        float grp_norm = sqrtf(norm_sq);
+        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
+        turbo_cpu_fwht(buf, group_size);
+
+        float recon_sq = 0.0f;
+        for (int b = 0; b < blocks_per_group; b++) {
+            block_turbo2_0 * blk = &grp_dst[b];
+            const int off = b * QK_TURBO2_0;
+
+            memset(blk->qs, 0, QK_TURBO2_0 / 4);
+
+            for (int j = 0; j < QK_TURBO2_0; j++) {
+                int idx = nearest_centroid_2bit(buf[off + j]);
+                blk->qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+                recon_sq += CENTROIDS_2BIT[idx] * CENTROIDS_2BIT[idx];
+            }
+        }
+
+        float recon_norm = sqrtf(recon_sq);
+        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        for (int b = 0; b < blocks_per_group; b++) {
+            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
+        }
+    }
+}
+
+void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2_0 == 0);
+    const int nb = k / QK_TURBO2_0;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO2_0; j++) {
+            uint8_t idx = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
+            y[block * QK_TURBO2_0 + j] = CENTROIDS_2BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix;
+    assert(n_per_row % QK_TURBO2_0 == 0);
+    size_t row_size = (n_per_row / QK_TURBO2_0) * sizeof(block_turbo2_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo2_0_ref(
+            src + row * n_per_row,
+            (block_turbo2_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+// ===================== TurboQuant 4-bit (turbo4_0) =====================
+// 4-bit pure PolarQuant, 16 symmetric Lloyd-Max centroids, block-32, group-128
+// No QJL sign bit — pure 4-bit quantization after WHT rotation (graph-side)
+
+static const float CENTROIDS_4BIT[16] = {
+    -0.240210f, -0.181385f, -0.141492f, -0.109598f,
+    -0.082046f, -0.057088f, -0.033692f, -0.011141f,
+     0.011141f,  0.033692f,  0.057088f,  0.082046f,
+     0.109598f,  0.141492f,  0.181385f,  0.240210f
+};
+
+static int nearest_centroid_4bit(float val) {
+    // Decision boundaries (midpoints between consecutive centroids)
+    if (val < -0.210798f) return 0;
+    if (val < -0.161439f) return 1;
+    if (val < -0.125545f) return 2;
+    if (val < -0.095822f) return 3;
+    if (val < -0.069567f) return 4;
+    if (val < -0.045390f) return 5;
+    if (val < -0.022416f) return 6;
+    if (val <  0.000000f) return 7;
+    if (val <  0.022416f) return 8;
+    if (val <  0.045390f) return 9;
+    if (val <  0.069567f) return 10;
+    if (val <  0.095822f) return 11;
+    if (val <  0.125545f) return 12;
+    if (val <  0.161439f) return 13;
+    if (val <  0.210798f) return 14;
+    return 15;
+}
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO4_0 == 0);
+
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
+
+    const int n_groups = k / group_size;
+    const int blocks_per_group = group_size / QK_TURBO4_0;
+
+    for (int g = 0; g < n_groups; g++) {
+        const float * grp_src = x + g * group_size;
+        block_turbo4_0 * grp_dst = y + g * blocks_per_group;
+
+        float norm_sq = 0.0f;
+        float buf[128];
+        for (int j = 0; j < group_size; j++) {
+            buf[j] = grp_src[j];
+            norm_sq += buf[j] * buf[j];
+        }
+        float grp_norm = sqrtf(norm_sq);
+        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
+        turbo_cpu_fwht(buf, group_size);
+
+        float recon_sq = 0.0f;
+        for (int b = 0; b < blocks_per_group; b++) {
+            block_turbo4_0 * blk = &grp_dst[b];
+            const int off = b * QK_TURBO4_0;
+
+            memset(blk->qs, 0, QK_TURBO4_0 / 2);
+
+            for (int j = 0; j < QK_TURBO4_0; j++) {
+                int idx = nearest_centroid_4bit(buf[off + j]);
+                blk->qs[j / 2] |= (uint8_t)(idx & 0x0F) << ((j % 2) * 4);
+                recon_sq += CENTROIDS_4BIT[idx] * CENTROIDS_4BIT[idx];
+            }
+        }
+
+        float recon_norm = sqrtf(recon_sq);
+        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        for (int b = 0; b < blocks_per_group; b++) {
+            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
+        }
+    }
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO4_0 == 0);
+    const int nb = k / QK_TURBO4_0;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO4_0; j++) {
+            uint8_t idx = (x[block].qs[j / 2] >> ((j % 2) * 4)) & 0x0F;
+            y[block * QK_TURBO4_0 + j] = CENTROIDS_4BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix;
+    assert(n_per_row % QK_TURBO4_0 == 0);
+    size_t row_size = (n_per_row / QK_TURBO4_0) * sizeof(block_turbo4_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo4_0_ref(
+            src + row * n_per_row,
+            (block_turbo4_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
@@ -5789,6 +6126,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_RQ5_1:
         case GGML_TYPE_RQ6_1:
             // rotor types: nothing special to validate beyond size checks
+            break;
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO2_0:
+            // turbo WHT types: nothing special to validate beyond size checks
             break;
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

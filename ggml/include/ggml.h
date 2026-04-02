@@ -436,7 +436,10 @@ extern "C" {
         GGML_TYPE_RQ4_1    = 46, // RotorQuant 3-bit dk64: Clifford rotor + Lloyd-Max
         GGML_TYPE_RQ5_1    = 47, // RotorQuant 4-bit dk64: Clifford rotor + Lloyd-Max
         GGML_TYPE_RQ6_1    = 48, // RotorQuant 5-bit dk64: Clifford rotor + Lloyd-Max
-        GGML_TYPE_COUNT    = 49,
+        GGML_TYPE_TURBO3_0 = 49, // TurboQuant 3-bit WHT (32-element blocks)
+        GGML_TYPE_TURBO2_0 = 50, // TurboQuant 2-bit WHT (32-element blocks)
+        GGML_TYPE_TURBO4_0 = 51, // TurboQuant 4-bit WHT pure PolarQuant (32-element blocks, 16 centroids)
+        GGML_TYPE_COUNT    = 52,
     };
 
     // precision
