@@ -3295,10 +3295,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_GEMMA4A:
             {
                 GGML_ASSERT(imgs.entries.size() == 1);
-                const int n_tokens = clip_n_output_tokens(ctx, imgs.entries.front().get());
                 const int d_model = ctx->model.hparams.n_embd;
                 const int half_d = d_model / 2;
-                const int max_past = 12;
 
                 // 1. Sinusoidal relative position embeddings: [hidden, 13]
                 {
@@ -3315,28 +3313,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                     set_input_f32("audio_pos_emb", pos_emb);
                 }
 
-                // 2. Sliding window attention mask: [seq, seq]
-                {
-                    std::vector<float> mask(n_tokens * n_tokens, -1e9f);
-                    for (int i = 0; i < n_tokens; i++) {
-                        for (int j = std::max(0, i - max_past); j <= i; j++) {
-                            mask[i * n_tokens + j] = 0.0f;
-                        }
-                    }
-                    set_input_f32("audio_attn_mask", mask);
-                }
-
-                // 3. Toeplitz diagonal masks: 13 matrices [seq, seq]
-                // diag_mask_d[i, j] = 1.0 if j == i - d, else 0.0
-                for (int d = 0; d < 13; d++) {
-                    std::vector<float> diag(n_tokens * n_tokens, 0.0f);
-                    for (int i = d; i < n_tokens; i++) {
-                        diag[i * n_tokens + (i - d)] = 1.0f;
-                    }
-                    char name[64];
-                    snprintf(name, sizeof(name), "audio_diag_%d", d);
-                    set_input_f32(name, diag);
-                }
+                // Chunked attention uses zero-padding for context — no explicit mask needed
             } break;
         default:
             GGML_ABORT("Unknown projector type");
