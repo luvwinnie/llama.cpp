@@ -287,10 +287,11 @@ ggml_cgraph * clip_graph_gemma4a::build() {
             // mul_mat(scores[CTX,CHUNK,b], V_ctx_t[CTX,dh,b]) → [CHUNK, dh, b]
             ggml_tensor * attn_out = ggml_mul_mat(ctx0, scores, V_ctx_t); // [CHUNK, dh, NB*nh]
 
-            // Reshape back: [CHUNK, dh, NB*nh] → [CHUNK, dh, nh, NB]
+            // Reshape back: [CHUNK, dh, nh*NB] → [CHUNK, dh, nh, NB]
             attn_out = ggml_reshape_4d(ctx0, attn_out, CHUNK, d_head, n_head, NB);
-            // Permute to [dh, CHUNK, nh, NB] → [dh*nh, CHUNK*NB] = [hidden, S_PAD]
-            attn_out = ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 1, 0, 3, 2)); // [dh, CHUNK, NB, nh]
+            // HF: [batch, NB, CHUNK, heads, d_head] → [batch, NB*CHUNK, heads*d_head]
+            // Need [dh, nh, CHUNK, NB] so flatten gives [dh*nh=hidden, CHUNK*NB=seq]
+            attn_out = ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 1, 2, 0, 3)); // [dh, nh, CHUNK, NB]
             attn_out = ggml_reshape_2d(ctx0, attn_out, d_head * n_head, CHUNK * NB); // [hidden, S_PAD]
 
             // Truncate to original seq length
@@ -344,10 +345,8 @@ ggml_cgraph * clip_graph_gemma4a::build() {
 
     cur = build_mm(model.pre_encode_out_w, cur);
     cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
-    // embed_audio: RMSNorm (no weight) → Linear
-    // HF applies Gemma4RMSNorm(with_scale=False) before projection
-    // Disabled for now — reduces quality, suggests conformer output stats are off
-    // TODO: fix conformer to produce correct output magnitude, then enable
+    // embed_audio: parameterless RMSNorm → Linear (matching HF exactly)
+    cur = ggml_rms_norm(ctx0, cur, 1e-6f);
     cur = build_mm(model.mm_audio_inp_proj_w, cur);
     cb(cur, "projected", -1);
 
