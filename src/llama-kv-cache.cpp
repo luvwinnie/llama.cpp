@@ -307,6 +307,56 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
+    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+    if (attn_rot_disable) {
+        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+    }
+
+    // Skip Hadamard rotation for RotorQuant types (they have their own Clifford rotation)
+    const bool is_rq_k = (type_k == GGML_TYPE_RQ3_1 || type_k == GGML_TYPE_RQ4_1 ||
+                          type_k == GGML_TYPE_RQ5_1 || type_k == GGML_TYPE_RQ6_1);
+    const bool is_rq_v = (type_v == GGML_TYPE_RQ3_1 || type_v == GGML_TYPE_RQ4_1 ||
+                          type_v == GGML_TYPE_RQ5_1 || type_v == GGML_TYPE_RQ6_1);
+
+    attn_rot_k =
+        !attn_rot_disable &&
+        ggml_is_quantized(type_k) &&
+        !is_rq_k &&
+        !hparams.is_n_embd_k_gqa_variable() &&
+        hparams.n_embd_head_k() % 64 == 0;
+
+    attn_rot_v =
+        !attn_rot_disable &&
+        ggml_is_quantized(type_v) &&
+        !is_rq_v &&
+        !hparams.is_n_embd_v_gqa_variable() &&
+        hparams.n_embd_head_v() % 64 == 0;
+
+    LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
+
+    // pre-compute the haramard matrices and keep them in host memory
+    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
+    if (attn_rot_k || attn_rot_v) {
+        for (int64_t n = 64; n <= std::max(hparams.n_embd_head_k(), hparams.n_embd_head_v()); n *= 2) {
+            attn_rot_hadamard[n] = std::vector<float>(n*n);
+
+            ggml_init_params params = {
+                /* .mem_size   = */ 1*ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+
+            ggml_context_ptr ctx { ggml_init(params) };
+
+            ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
+            tmp->data = attn_rot_hadamard[n].data();
+
+            ggml_gen_hadamard(tmp);
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -1298,21 +1348,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    // Skip Hadamard rotation for RotorQuant types (they have their own Clifford rotation)
-    // turbo2_0/turbo3_0 USE Hadamard rotation — their set_rows WHT provides the rotation,
-    // but we still need Q to be rotated for correct attention dot products.
-    // The Hadamard from PR #21038 handles Q rotation; set_rows WHT handles K/V rotation.
-    // Both use the same randomized Hadamard basis, so <H*q, H*k> = <q, k>.
-    const bool is_rq_k = (type_k() == GGML_TYPE_RQ3_1 || type_k() == GGML_TYPE_RQ4_1 ||
-                          type_k() == GGML_TYPE_RQ5_1 || type_k() == GGML_TYPE_RQ6_1);
-
-    const bool can_k_rot =
-        ggml_is_quantized(type_k()) &&
-        !is_rq_k &&
-        !hparams.is_n_embd_k_gqa_variable() &&
-        hparams.n_embd_head_k() % 64 == 0;
-
-    if (can_k_rot) {
+    if (attn_rot_k) {
         int nrot = 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
@@ -1333,16 +1369,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    const bool is_rq_v = (type_v() == GGML_TYPE_RQ3_1 || type_v() == GGML_TYPE_RQ4_1 ||
-                          type_v() == GGML_TYPE_RQ5_1 || type_v() == GGML_TYPE_RQ6_1);
-
-    const bool can_v_rot =
-        ggml_is_quantized(type_v()) &&
-        !is_rq_v &&
-        !hparams.is_n_embd_v_gqa_variable() &&
-        hparams.n_embd_head_v() % 64 == 0;
-
-    if (can_v_rot) {
+    if (attn_rot_v) {
         int nrot = 64;
         // using smaller rotation matrices for V seems beneficial
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
@@ -1680,13 +1707,19 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    ggml_gen_hadamard(dst);
+    const auto n_rot = dst->ne[0];
+    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
+
+    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    ggml_gen_hadamard(dst);
+    const auto n_rot = dst->ne[0];
+    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
+
+    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 size_t llama_kv_cache::total_size() const {
