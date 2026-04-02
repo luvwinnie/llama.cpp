@@ -262,6 +262,7 @@ struct filter_params {
     bool    use_natural_log = false;
     bool    norm_per_feature = false;
     float   mel_floor = 0.f;  // if > 0, clamp mel energy before log (e.g. 0.001 for Gemma4)
+    bool    use_magnitude = false;  // if true, use |STFT| instead of |STFT|² (Gemma4)
 };
 
 static void log_mel_spectrogram_worker_thread(int                        ith,
@@ -306,6 +307,9 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
         // Use pow(fft_out[2 * j + 0], 2) + pow(fft_out[2 * j + 1], 2) causes inference quality problem? Interesting.
         for (int j = 0; j < n_fft_bins; j++) {
             fft_out[j] = (fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1]);
+            if (params.use_magnitude) {
+                fft_out[j] = sqrt(fft_out[j]); // magnitude instead of power
+            }
         }
 
         // mel spectrogram
@@ -659,18 +663,24 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
     params.hann_window_size = hparams.audio_window_len;  // 320 for Gemma 4
     params.hop_length       = hparams.audio_hop_len;      // 160
     params.sample_rate      = hparams.audio_sample_rate;   // 16000
-    params.center_padding   = false;  // Gemma 4: no center padding
+    params.center_padding   = false;  // Gemma 4: semicausal pad handled below
     params.preemph          = 0.0f;   // Gemma 4: no preemphasis
     params.use_natural_log  = true;   // log mel
     params.norm_per_feature = false;  // Gemma 4: no per-feature normalization
     params.mel_floor        = 0.001f; // Gemma 4: clamp mel energy at 0.001 before log
+    params.use_magnitude    = true;   // Gemma 4: |STFT| not |STFT|²
 
     GGML_ASSERT(!cache.sin_vals.empty());
     GGML_ASSERT(!cache.cos_vals.empty());
     GGML_ASSERT(!cache.filters.data.empty());
 
+    // Semicausal padding: prepend frame_length/2 = 160 zeros
+    const int pad_left = hparams.audio_window_len / 2;
+    std::vector<float> padded_samples(pad_left + n_samples, 0.0f);
+    std::copy(samples, samples + n_samples, padded_samples.begin() + pad_left);
+
     mtmd_audio_mel out_full;
-    bool ok = log_mel_spectrogram(samples, n_samples, 4, params, cache, out_full);
+    bool ok = log_mel_spectrogram(padded_samples.data(), padded_samples.size(), 4, params, cache, out_full);
     if (!ok) {
         return false;
     }
