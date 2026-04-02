@@ -164,6 +164,9 @@ struct clip_layer {
     ggml_tensor * q_norm = nullptr;
 
     ggml_tensor * attn_post_norm_w = nullptr;
+    ggml_tensor * attn_pre_norm_w  = nullptr; // gemma4a
+    ggml_tensor * attn_k_rel_w     = nullptr; // gemma4a relative position key
+    ggml_tensor * per_dim_scale_w  = nullptr; // gemma4a per-dimension learned scale
 
     ggml_tensor * ff_up_w = nullptr;
     ggml_tensor * ff_up_b = nullptr;
@@ -176,7 +179,8 @@ struct clip_layer {
     ggml_tensor * ln_2_w = nullptr;
     ggml_tensor * ln_2_b = nullptr;
 
-    ggml_tensor * ff_post_norm_w = nullptr;
+    ggml_tensor * ff_post_norm_w  = nullptr;
+    ggml_tensor * ff_post_norm_1_w = nullptr; // gemma4a second FFN post-norm
 
     // layer scale (no bias)
     ggml_tensor * ls_1_w   = nullptr;
@@ -441,6 +445,11 @@ struct clip_model {
     std::array<ggml_tensor *, 7> pre_encode_conv_X_b = {nullptr};
     ggml_tensor * pre_encode_out_w = nullptr;
     ggml_tensor * pre_encode_out_b = nullptr;
+
+    // gemma4a audio
+    std::array<ggml_tensor *, 2> conv_norm_w_arr = {nullptr}; // per-conv-layer norms
+    ggml_tensor * audio_inp_proj_w = nullptr; // a.input_projection
+    ggml_tensor * mm_audio_inp_proj_w = nullptr; // mm.a.input_projection (audio adapter)
 
     // gemma4
     ggml_tensor * std_bias = nullptr;

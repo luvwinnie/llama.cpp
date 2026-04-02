@@ -161,8 +161,15 @@
 #define TN_SAM_FFN_DOWN   "v.sam.blk.%d.mlp.lin2.%s"
 #define TN_SAM_NECK       "v.sam.neck.%d.%s"
 #define TN_SAM_NET        "v.sam.net_%d.%s"
-// (conformer) lfm2
+// (conformer) lfm2 / gemma4a
 #define TN_PRE_ENCODE_OUT  "a.pre_encode.out.%s"
+#define TN_CONV1D_NORM     "a.conv1d.%d.norm.%s"     // gemma4a conv layer norm
+#define TN_AUDIO_INP_PROJ  "a.input_projection.%s"    // gemma4a input projection
+#define TN_ATTN_PRE_NORM   "%s.blk.%d.attn_pre_norm.%s"  // gemma4a
+#define TN_ATTN_K_REL      "%s.blk.%d.attn_k_rel.%s"     // gemma4a relative pos key
+#define TN_PER_DIM_SCALE   "%s.blk.%d.per_dim_scale.%s"   // gemma4a per-dim scale
+#define TN_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s" // gemma4a
+#define TN_MM_AUDIO_INP_PROJ "mm.a.input_projection.%s"   // gemma4a audio adapter
 #define TN_FFN_NORM        "%s.blk.%d.ffn_norm.%s"
 #define TN_FFN_NORM_1      "%s.blk.%d.ffn_norm_1.%s"
 #define TN_FFN_UP_1        "%s.blk.%d.ffn_up_1.%s"

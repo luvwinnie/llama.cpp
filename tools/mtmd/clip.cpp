@@ -918,6 +918,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_conformer>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                builder = std::make_unique<clip_graph_gemma4a>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_GLM4V:
             {
                 builder = std::make_unique<clip_graph_glm4v>(ctx, img);
@@ -1409,6 +1413,7 @@ struct clip_model_loader {
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
                      } break;
                 case PROJECTOR_TYPE_LFM2A:
+                case PROJECTOR_TYPE_GEMMA4A:
                     {
                         // audio preprocessing params
                         hparams.audio_chunk_len        = 1; // in seconds
@@ -2131,6 +2136,60 @@ struct clip_model_loader {
                         layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
                     }
                 } break;
+            case PROJECTOR_TYPE_GEMMA4A:
+                {
+                    // conv subsampling: 2 conv layers with norm (no bias)
+                    for (int i : {0, 1}) {
+                        model.pre_encode_conv_X_w[i] = get_tensor(string_format(TN_CONV1D, i, "weight"));
+                        model.conv_norm_w_arr[i]     = get_tensor(string_format(TN_CONV1D_NORM, i, "weight"));
+                    }
+
+                    // input projection (after conv, before conformer blocks)
+                    model.audio_inp_proj_w = get_tensor(string_format(TN_AUDIO_INP_PROJ, "weight"));
+
+                    // output projection (after conformer blocks)
+                    model.pre_encode_out_w = get_tensor(string_format(TN_PRE_ENCODE_OUT, "weight"));
+                    model.pre_encode_out_b = get_tensor(string_format(TN_PRE_ENCODE_OUT, "bias"));
+
+                    // audio adapter (single linear projection to LLM embedding dim)
+                    model.mm_audio_inp_proj_w = get_tensor(string_format(TN_MM_AUDIO_INP_PROJ, "weight"));
+
+                    for (int il = 0; il < hparams.n_layer; ++il) {
+                        auto & layer = model.layers[il];
+
+                        // gemma4a-specific per-layer tensors
+                        layer.per_dim_scale_w    = get_tensor(string_format(TN_PER_DIM_SCALE,   prefix, il, "weight"));
+                        layer.attn_pre_norm_w    = get_tensor(string_format(TN_ATTN_PRE_NORM,   prefix, il, "weight"));
+                        layer.attn_post_norm_w   = get_tensor(string_format(TN_ATTN_POST_NORM,  prefix, il, "weight"));
+                        layer.attn_k_rel_w       = get_tensor(string_format(TN_ATTN_K_REL,      prefix, il, "weight"));
+                        layer.ff_post_norm_w     = get_tensor(string_format(TN_FFN_POST_NORM,   prefix, il, "weight"));
+                        layer.ff_post_norm_1_w   = get_tensor(string_format(TN_FFN_POST_NORM_1, prefix, il, "weight"));
+                        layer.ln_2_w             = get_tensor(string_format(TN_LN_2, prefix, il, "weight"));
+
+                        // attention weights (no bias)
+                        layer.q_w = get_tensor(string_format(TN_ATTN_Q, prefix, il, "weight"));
+                        layer.k_w = get_tensor(string_format(TN_ATTN_K, prefix, il, "weight"));
+                        layer.v_w = get_tensor(string_format(TN_ATTN_V, prefix, il, "weight"));
+                        layer.o_w = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "weight"));
+
+                        // FFN 1 (no bias)
+                        layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "weight"));
+                        layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "weight"));
+
+                        // FFN 2 (no bias)
+                        layer.ff_norm_w   = get_tensor(string_format(TN_FFN_NORM,   prefix, il, "weight"));
+                        layer.ff_norm_1_w = get_tensor(string_format(TN_FFN_NORM_1, prefix, il, "weight"));
+                        layer.ff_up_1_w   = get_tensor(string_format(TN_FFN_UP_1,   prefix, il, "weight"));
+                        layer.ff_down_1_w = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "weight"));
+
+                        // conv module
+                        layer.norm_conv_w = get_tensor(string_format(TN_NORM_CONV, prefix, il, "weight"));
+                        layer.conv_norm_w = get_tensor(string_format(TN_CONV_NORM, prefix, il, "weight"));
+                        layer.conv_dw_w   = get_tensor(string_format(TN_CONV_DW,   prefix, il, "weight"));
+                        layer.conv_pw1_w  = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "weight"));
+                        layer.conv_pw2_w  = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "weight"));
+                    }
+                } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
         }
@@ -2437,8 +2496,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
             // we can remove this check when we implement audio support for Gemma 3N
-            skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV
-                || ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA4V;
+            skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV;
         }
 
         if (loader.has_audio && !skip_audio) {
@@ -2771,6 +2829,11 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_LFM2A:
             {
                 n_patches = ((((img->nx + 1) / 2) + 1) / 2 + 1) / 2;
+            } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                // 2 conv layers with stride 2 each: T -> T/2 -> T/4
+                n_patches = ((img->nx + 1) / 2 + 1) / 2;
             } break;
         default:
             GGML_ABORT("unsupported projector type");
@@ -3216,6 +3279,10 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 }
                 set_input_f32("pos_emb", pos_emb);
             } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                // gemma4a uses relative position attention (attn_k_rel), no external pos input needed
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -3352,6 +3419,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_LFM2A:
             return ctx->model.position_embeddings->ne[0];
+        case PROJECTOR_TYPE_GEMMA4A:
+            return ctx->model.mm_audio_inp_proj_w->ne[1];
         case PROJECTOR_TYPE_GLM4V:
             return ctx->model.mm_ffn_down_w->ne[1];
         default:
