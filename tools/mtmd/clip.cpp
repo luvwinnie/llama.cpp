@@ -3281,7 +3281,24 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             } break;
         case PROJECTOR_TYPE_GEMMA4A:
             {
-                // gemma4a uses relative position attention (attn_k_rel), no external pos input needed
+                // Sinusoidal relative position embeddings: 13 positions, hidden_size=1024
+                // HF: position_ids = arange(12, -1, -1), inv_timescales from 1.0 * exp(-i * log(10000) / (d/2))
+                // Layout: [sin(pos*freq), cos(pos*freq)] concatenated
+                const int n_pos = 13;
+                const int d_model = ctx->model.hparams.n_embd; // 1024
+                const int half_d = d_model / 2;
+                std::vector<float> pos_emb(d_model * n_pos);
+
+                for (int p = 0; p < n_pos; p++) {
+                    float pos = (float)(12 - p); // arange(12, -1, -1)
+                    for (int i = 0; i < half_d; i++) {
+                        float freq = std::exp(-(std::log(10000.0f) / std::max(half_d - 1, 1)) * (float)i);
+                        float angle = pos * freq;
+                        pos_emb[p * d_model + i]          = std::sin(angle);
+                        pos_emb[p * d_model + half_d + i] = std::cos(angle);
+                    }
+                }
+                set_input_f32("audio_pos_emb", pos_emb);
             } break;
         default:
             GGML_ABORT("Unknown projector type");
