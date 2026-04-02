@@ -1413,13 +1413,21 @@ struct clip_model_loader {
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
                      } break;
                 case PROJECTOR_TYPE_LFM2A:
-                case PROJECTOR_TYPE_GEMMA4A:
                     {
-                        // audio preprocessing params
-                        hparams.audio_chunk_len        = 1; // in seconds
+                        hparams.audio_chunk_len        = 1;
                         hparams.audio_sample_rate      = 16000;
                         hparams.audio_n_fft            = 512;
                         hparams.audio_window_len       = 400;
+                        hparams.audio_hop_len          = 160;
+                    } break;
+                case PROJECTOR_TYPE_GEMMA4A:
+                    {
+                        // Gemma 4 audio: frame_length=320, hop=160, fft=512
+                        // HF Gemma4AudioFeatureExtractor params
+                        hparams.audio_chunk_len        = 30; // max 30 seconds
+                        hparams.audio_sample_rate      = 16000;
+                        hparams.audio_n_fft            = 512;
+                        hparams.audio_window_len       = 320; // frame_length, NOT 400!
                         hparams.audio_hop_len          = 160;
                     } break;
                 case PROJECTOR_TYPE_JANUS_PRO:

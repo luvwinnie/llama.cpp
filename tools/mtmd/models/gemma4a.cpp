@@ -98,11 +98,12 @@ ggml_cgraph * clip_graph_gemma4a::build() {
             cur = ggml_rms_norm(ctx0, cur, eps);
             cur = ggml_mul(ctx0, cur, layer.attn_pre_norm_w);
 
-            // Q with softplus(per_dim_scale) * q_scale
+            // Q with per_dim_scale * q_scale
+            // NOTE: per_dim_scale is already softplus'd by convert_hf_to_gguf.py
             ggml_tensor * Q = build_mm(layer.q_w, cur);
             {
                 Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, S);
-                auto * s = ggml_scale(ctx0, ggml_softplus(ctx0, layer.per_dim_scale_w), q_scale);
+                auto * s = ggml_scale(ctx0, layer.per_dim_scale_w, q_scale);
                 Q = ggml_mul(ctx0, Q, s);
             }
             Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // [dh, S, nh]

@@ -628,6 +628,48 @@ bool mtmd_audio_preprocessor_conformer::preprocess(const float *                
 }
 
 //
+// mtmd_audio_preprocessor_gemma4a
+//
+
+void mtmd_audio_preprocessor_gemma4a::initialize() {
+    cache.fill_sin_cos_table(hparams.audio_n_fft);
+    cache.fill_hann_window(hparams.audio_window_len, true);
+    cache.fill_mel_filterbank_matrix(hparams.n_mel_bins, hparams.audio_n_fft, hparams.audio_sample_rate);
+}
+
+bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 samples,
+                                                  size_t                        n_samples,
+                                                  std::vector<mtmd_audio_mel> & output) {
+    if (n_samples == 0) {
+        return false;
+    }
+
+    filter_params params;
+    params.n_mel            = hparams.n_mel_bins;
+    params.n_fft_bins       = 1 + (hparams.audio_n_fft / 2);
+    params.hann_window_size = hparams.audio_window_len;  // 320 for Gemma 4
+    params.hop_length       = hparams.audio_hop_len;      // 160
+    params.sample_rate      = hparams.audio_sample_rate;   // 16000
+    params.center_padding   = false;  // Gemma 4: no center padding
+    params.preemph          = 0.0f;   // Gemma 4: no preemphasis
+    params.use_natural_log  = true;   // log mel
+    params.norm_per_feature = false;  // Gemma 4: no per-feature normalization
+
+    GGML_ASSERT(!cache.sin_vals.empty());
+    GGML_ASSERT(!cache.cos_vals.empty());
+    GGML_ASSERT(!cache.filters.data.empty());
+
+    mtmd_audio_mel out_full;
+    bool ok = log_mel_spectrogram(samples, n_samples, 4, params, cache, out_full);
+    if (!ok) {
+        return false;
+    }
+
+    output.push_back(std::move(out_full));
+    return true;
+}
+
+//
 // mtmd_audio_streaming_istft implementation
 //
 
