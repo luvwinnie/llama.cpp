@@ -3281,24 +3281,37 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             } break;
         case PROJECTOR_TYPE_GEMMA4A:
             {
-                // Sinusoidal relative position embeddings: 13 positions, hidden_size=1024
-                // HF: position_ids = arange(12, -1, -1), inv_timescales from 1.0 * exp(-i * log(10000) / (d/2))
-                // Layout: [sin(pos*freq), cos(pos*freq)] concatenated
-                const int n_pos = 13;
-                const int d_model = ctx->model.hparams.n_embd; // 1024
+                GGML_ASSERT(imgs.entries.size() == 1);
+                const int n_tokens = clip_n_output_tokens(ctx, imgs.entries.front().get());
+                const int d_model = ctx->model.hparams.n_embd;
                 const int half_d = d_model / 2;
-                std::vector<float> pos_emb(d_model * n_pos);
+                const int max_past = 12;
 
-                for (int p = 0; p < n_pos; p++) {
-                    float pos = (float)(12 - p); // arange(12, -1, -1)
-                    for (int i = 0; i < half_d; i++) {
-                        float freq = std::exp(-(std::log(10000.0f) / std::max(half_d - 1, 1)) * (float)i);
-                        float angle = pos * freq;
-                        pos_emb[p * d_model + i]          = std::sin(angle);
-                        pos_emb[p * d_model + half_d + i] = std::cos(angle);
+                // 1. Sinusoidal relative position embeddings: [hidden, 13]
+                {
+                    std::vector<float> pos_emb(d_model * 13);
+                    for (int p = 0; p < 13; p++) {
+                        float pos_val = (float)(12 - p);
+                        for (int i = 0; i < half_d; i++) {
+                            float freq = std::exp(-(std::log(10000.0f) / std::max(half_d - 1, 1)) * (float)i);
+                            float angle = pos_val * freq;
+                            pos_emb[p * d_model + i]          = std::sin(angle);
+                            pos_emb[p * d_model + half_d + i] = std::cos(angle);
+                        }
                     }
+                    set_input_f32("audio_pos_emb", pos_emb);
                 }
-                set_input_f32("audio_pos_emb", pos_emb);
+
+                // 2. Sliding window attention mask: [seq, seq]
+                {
+                    std::vector<float> mask(n_tokens * n_tokens, -1e9f);
+                    for (int i = 0; i < n_tokens; i++) {
+                        for (int j = std::max(0, i - max_past); j <= i; j++) {
+                            mask[i * n_tokens + j] = 0.0f;
+                        }
+                    }
+                    set_input_f32("audio_attn_mask", mask);
+                }
             } break;
         default:
             GGML_ABORT("Unknown projector type");
