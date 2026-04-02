@@ -261,6 +261,7 @@ struct filter_params {
     float   preemph = 0.f;
     bool    use_natural_log = false;
     bool    norm_per_feature = false;
+    float   mel_floor = 0.f;  // if > 0, clamp mel energy before log (e.g. 0.001 for Gemma4)
 };
 
 static void log_mel_spectrogram_worker_thread(int                        ith,
@@ -324,15 +325,23 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
             for (; k < n_fft_bins; k++) {
                 sum += fft_out[k] * filters.data[j * n_fft_bins + k];
             }
-            sum = params.use_natural_log
-                ? log(sum + 5.960464477539063e-08)
-                : log10(std::max(sum, 1e-10));
+            if (params.mel_floor > 0.f) {
+                sum = params.use_natural_log
+                    ? log(std::max(sum, (double)params.mel_floor))
+                    : log10(std::max(sum, (double)params.mel_floor));
+            } else {
+                sum = params.use_natural_log
+                    ? log(sum + 5.960464477539063e-08)
+                    : log10(std::max(sum, 1e-10));
+            }
             out.data[j * out.n_len + i] = sum;
         }
     }
 
-    // Otherwise fft_out are all zero
-    double sum = params.use_natural_log ? log(1e-10) : log10(1e-10);
+    // Otherwise fft_out are all zero — use floor value
+    double sum = params.mel_floor > 0.f
+        ? (params.use_natural_log ? log((double)params.mel_floor) : log10((double)params.mel_floor))
+        : (params.use_natural_log ? log(1e-10) : log10(1e-10));
     for (; i < out.n_len; i += n_threads) {
         for (int j = 0; j < out.n_mel; j++) {
             out.data[j * out.n_len + i] = sum;
@@ -654,6 +663,7 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
     params.preemph          = 0.0f;   // Gemma 4: no preemphasis
     params.use_natural_log  = true;   // log mel
     params.norm_per_feature = false;  // Gemma 4: no per-feature normalization
+    params.mel_floor        = 0.001f; // Gemma 4: clamp mel energy at 0.001 before log
 
     GGML_ASSERT(!cache.sin_vals.empty());
     GGML_ASSERT(!cache.cos_vals.empty());
