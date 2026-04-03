@@ -18,18 +18,19 @@ ggml_cgraph * clip_graph_gemma4a::build() {
     auto * cur = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
     cur = ggml_reshape_4d(ctx0, cur, cur->ne[0], cur->ne[1], 1, 1);
 
-    // conv subsampling with LayerNorm + ReLU (using ggml_conv_2d)
+    // conv subsampling with LayerNorm + ReLU
     for (int ci = 0; ci < 2; ci++) {
         cur = ggml_conv_2d(ctx0, model.pre_encode_conv_X_w[ci], cur, 2, 2, 1, 1, 1, 1);
         // cur: [OW, OH, OC, 1]
         {
             int64_t ow = cur->ne[0], oh = cur->ne[1], oc = cur->ne[2];
-            cur = ggml_reshape_4d(ctx0, cur, ow * oh, oc, 1, 1);
-            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OC, spatial]
+            // Flatten spatial + permute: [OW*OH, OC] then [OC, OW*OH]
+            cur = ggml_reshape_2d(ctx0, cur, ow * oh, oc);
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OC, OW*OH]
             cur = ggml_norm(ctx0, cur, eps);
             cur = ggml_mul(ctx0, cur, model.conv_norm_w_arr[ci]);
-            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [spatial, OC]
-            cur = ggml_reshape_4d(ctx0, cur, ow, oh, oc, 1); // [OW, OH, OC, 1]
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OW*OH, OC]
+            cur = ggml_reshape_4d(ctx0, cur, ow, oh, oc, 1);
         }
         cur = ggml_relu(ctx0, cur);
     }
