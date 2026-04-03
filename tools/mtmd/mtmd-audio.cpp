@@ -291,14 +291,16 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
     for (; i < std::min(n_samples / frame_step + 1, out.n_len); i += n_threads) {
         const int offset = i * frame_step;
 
-        // apply Hann window (~10% faster)
-        for (int j = 0; j < std::min(frame_size, n_samples - offset); j++) {
-            fft_in[j] = hann[j] * samples[offset + j];
-        }
-
-        // fill the rest with zeros
-        if (n_samples - offset < frame_size) {
-            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0);
+        // apply Hann window (only up to hann_window_size, rest is zero-padded)
+        {
+            const int hann_size = params.hann_window_size;
+            const int avail = n_samples - offset;
+            const int windowed = std::min(hann_size, avail);
+            for (int j = 0; j < windowed; j++) {
+                fft_in[j] = hann[j] * samples[offset + j];
+            }
+            // zero-pad from windowed to frame_size (including unwindowed and missing samples)
+            std::fill(fft_in.begin() + windowed, fft_in.begin() + frame_size, 0.0f);
         }
 
         // FFT
