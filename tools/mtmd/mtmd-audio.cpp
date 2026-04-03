@@ -806,11 +806,24 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
         }
     }
 
-    // Debug: print first audio samples and mel values
-    fprintf(stderr, "GEMMA4A: n_samples=%zu, padded=%zu, n_frames=%d\n", n_samples, padded.size(), n_frames);
-    fprintf(stderr, "GEMMA4A SAMPLES [pad_left:pad_left+5]: %.8f %.8f %.8f %.8f %.8f\n",
-        padded[pad_left], padded[pad_left+1], padded[pad_left+2], padded[pad_left+3], padded[pad_left+4]);
-    fprintf(stderr, "GEMMA4A MEL: n_frames=%d, n_mel=%d\n", n_frames, n_mel);
+    // Debug: print mel values and first frame DFT
+    fprintf(stderr, "GEMMA4A: n_samples=%zu, n_frames=%d\n", n_samples, n_frames);
+    // Print DFT magnitude of frame 0 for bins 0-4
+    {
+        std::vector<float> dbg_in(n_fft, 0.0f);
+        for (int j = 0; j < frame_length; j++) dbg_in[j] = hann[j] * padded[j];
+        fprintf(stderr, "GEMMA4A DFT frame0 windowed[0:5]: %.8f %.8f %.8f %.8f %.8f\n",
+            dbg_in[0], dbg_in[1], dbg_in[2], dbg_in[3], dbg_in[4]);
+        for (int k = 0; k < 5; k++) {
+            double re = 0, im = 0;
+            for (int n = 0; n < n_fft; n++) {
+                double angle = 2.0 * M_PI * k * n / (double)n_fft;
+                re += dbg_in[n] * cos(angle);
+                im -= dbg_in[n] * sin(angle);
+            }
+            fprintf(stderr, "GEMMA4A DFT mag[%d]: %.8f (re=%.8f im=%.8f)\n", k, sqrt(re*re+im*im), re, im);
+        }
+    }
     fprintf(stderr, "GEMMA4A MEL [0,0:5]: %.4f %.4f %.4f %.4f %.4f\n",
         out_mel.data[0*n_frames+0], out_mel.data[1*n_frames+0], out_mel.data[2*n_frames+0],
         out_mel.data[3*n_frames+0], out_mel.data[4*n_frames+0]);
