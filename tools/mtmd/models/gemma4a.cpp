@@ -35,13 +35,13 @@ ggml_cgraph * clip_graph_gemma4a::build() {
         cur = ggml_relu(ctx0, cur);
     }
 
-    // flatten: [OW=freq, OH=seq, C=32, 1] → HF does [seq, freq, C] → [seq, freq*C]
-    // Need C fastest in dim0: permute to [C, OW=freq, OH=seq, 1] then reshape [C*freq, seq]
-    {
-        int64_t ow = cur->ne[0], oh = cur->ne[1], oc = cur->ne[2];
-        cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 2, 0, 1, 3)); // [C, freq, seq, 1]
-        cur = ggml_reshape_2d(ctx0, cur, oc * ow, oh); // [C*freq, seq]
-    }
+    // flatten: [OW=freq, OH=seq, OC=ch, 1]
+    // HF: [B,C,T,F] → permute(0,2,3,1) → [B,T,F,C] → reshape [B,T,F*C]
+    // Feature i = c*F + f → c=i//F, f=i%F
+    // ggml: [F, T, C, 1] → need [F, C, T, 1] → reshape [F*C, T]
+    // Feature i = f + c*F = c*F + f ✓ (matching HF)
+    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3)); // [F, C, T, 1]
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2]); // [F*C, T]
     cur = build_mm(model.audio_inp_proj_w, cur);
 
     const int64_t S = cur->ne[1];
