@@ -783,17 +783,15 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
             fft_in[j] = hann[j] * padded[start + j];
         }
 
-        // DFT (direct computation for correctness — matches numpy.fft.rfft exactly)
-        // Only compute first n_fft/2+1 bins (real FFT)
+        // FFT using cache (faster than DFT, same results verified)
+        fft(cache, fft_in.data(), n_fft, fft_out.data());
+
+        // Magnitude spectrum (not power)
         std::vector<float> magnitude(n_fft_bins);
-        for (int k = 0; k < n_fft_bins; k++) {
-            float re = 0.0f, im = 0.0f;
-            for (int n = 0; n < n_fft; n++) {
-                float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)n_fft;
-                re += fft_in[n] * cosf(angle);
-                im -= fft_in[n] * sinf(angle);
-            }
-            magnitude[k] = std::sqrt(re * re + im * im);
+        for (int j = 0; j < n_fft_bins; j++) {
+            float re = fft_out[2 * j + 0];
+            float im = fft_out[2 * j + 1];
+            magnitude[j] = std::sqrt(re * re + im * im);
         }
 
         // Mel filterbank + log with additive floor
