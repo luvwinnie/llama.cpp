@@ -261,8 +261,9 @@ struct filter_params {
     float   preemph = 0.f;
     bool    use_natural_log = false;
     bool    norm_per_feature = false;
-    float   mel_floor = 0.f;  // if > 0, clamp mel energy before log (e.g. 0.001 for Gemma4)
-    bool    use_magnitude = false;  // if true, use |STFT| instead of |STFT|² (Gemma4)
+    float   mel_floor = 0.f;      // if > 0, clamp/add mel energy before log (e.g. 0.001 for Gemma4)
+    bool    use_magnitude = false; // if true, use |STFT| instead of |STFT|² (Gemma4)
+    bool    mel_floor_add = false; // if true, ln(sum + floor); if false, ln(max(sum, floor))
 };
 
 static void log_mel_spectrogram_worker_thread(int                        ith,
@@ -330,9 +331,16 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
                 sum += fft_out[k] * filters.data[j * n_fft_bins + k];
             }
             if (params.mel_floor > 0.f) {
-                sum = params.use_natural_log
-                    ? log(std::max(sum, (double)params.mel_floor))
-                    : log10(std::max(sum, (double)params.mel_floor));
+                if (params.mel_floor_add) {
+                    // Gemma 4 style: ln(sum + floor)
+                    sum = params.use_natural_log
+                        ? log(sum + (double)params.mel_floor)
+                        : log10(sum + (double)params.mel_floor);
+                } else {
+                    sum = params.use_natural_log
+                        ? log(std::max(sum, (double)params.mel_floor))
+                        : log10(std::max(sum, (double)params.mel_floor));
+                }
             } else {
                 sum = params.use_natural_log
                     ? log(sum + 5.960464477539063e-08)
@@ -343,9 +351,14 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
     }
 
     // Otherwise fft_out are all zero — use floor value
-    double sum = params.mel_floor > 0.f
-        ? (params.use_natural_log ? log((double)params.mel_floor) : log10((double)params.mel_floor))
-        : (params.use_natural_log ? log(1e-10) : log10(1e-10));
+    double sum;
+    if (params.mel_floor > 0.f) {
+        // For additive mode (Gemma4): ln(0 + floor) = ln(floor)
+        // For max mode: ln(max(0, floor)) = ln(floor) — same result
+        sum = params.use_natural_log ? log((double)params.mel_floor) : log10((double)params.mel_floor);
+    } else {
+        sum = params.use_natural_log ? log(1e-10) : log10(1e-10);
+    }
     for (; i < out.n_len; i += n_threads) {
         for (int j = 0; j < out.n_mel; j++) {
             out.data[j * out.n_len + i] = sum;
@@ -647,7 +660,54 @@ bool mtmd_audio_preprocessor_conformer::preprocess(const float *                
 void mtmd_audio_preprocessor_gemma4a::initialize() {
     cache.fill_sin_cos_table(hparams.audio_n_fft);
     cache.fill_hann_window(hparams.audio_window_len, true);
-    cache.fill_mel_filterbank_matrix(hparams.n_mel_bins, hparams.audio_n_fft, hparams.audio_sample_rate);
+    // Gemma 4 uses HTK mel scale (2595 * log10(1 + f/700)), not Slaney
+    // Compute HTK mel filterbank directly
+    {
+        const int n_mel = hparams.n_mel_bins;
+        const int n_fft = hparams.audio_n_fft;
+        const int sr = hparams.audio_sample_rate;
+        const float fmin = 0.0f;
+        const float fmax = (float)sr / 2.0f;
+        const int n_freqs = n_fft / 2 + 1;
+
+        auto hz_to_mel = [](float hz) -> float { return 2595.0f * std::log10(1.0f + hz / 700.0f); };
+        auto mel_to_hz = [](float mel) -> float { return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f); };
+
+        float min_mel = hz_to_mel(fmin);
+        float max_mel = hz_to_mel(fmax);
+        std::vector<float> f_pts(n_mel + 2);
+        for (int i = 0; i < n_mel + 2; i++) {
+            float mel = min_mel + (max_mel - min_mel) * (float)i / (float)(n_mel + 1);
+            f_pts[i] = mel_to_hz(mel);
+        }
+
+        std::vector<float> all_freqs(n_freqs);
+        for (int i = 0; i < n_freqs; i++) {
+            all_freqs[i] = (float)i * (float)sr / (float)n_fft;
+        }
+
+        cache.filters.n_mel = n_mel;
+        cache.filters.n_fft = n_fft;
+        cache.filters.data.resize(n_mel * n_freqs, 0.0f);
+
+        for (int m = 0; m < n_mel; m++) {
+            float left = f_pts[m];
+            float center = f_pts[m + 1];
+            float right = f_pts[m + 2];
+
+            for (int k = 0; k < n_freqs; k++) {
+                float freq = all_freqs[k];
+                float w = 0.0f;
+                if (freq >= left && freq <= center && center > left) {
+                    w = (freq - left) / (center - left);
+                } else if (freq > center && freq <= right && right > center) {
+                    w = (right - freq) / (right - center);
+                }
+                // Store as [mel][freq] — matches our log_mel_spectrogram access pattern
+                cache.filters.data[m * n_freqs + k] = w;
+            }
+        }
+    }
 }
 
 bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 samples,
@@ -667,8 +727,9 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
     params.preemph          = 0.0f;   // Gemma 4: no preemphasis
     params.use_natural_log  = true;   // log mel
     params.norm_per_feature = false;  // Gemma 4: no per-feature normalization
-    params.mel_floor        = 0.001f; // Gemma 4: clamp mel energy at 0.001 before log
+    params.mel_floor        = 0.001f; // Gemma 4: add mel_floor before log (not clamp!)
     params.use_magnitude    = true;   // Gemma 4: |STFT| not |STFT|²
+    params.mel_floor_add    = true;   // Gemma 4: ln(sum + floor), not ln(max(sum, floor))
 
     GGML_ASSERT(!cache.sin_vals.empty());
     GGML_ASSERT(!cache.cos_vals.empty());
