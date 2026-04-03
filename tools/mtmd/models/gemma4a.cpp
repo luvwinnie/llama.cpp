@@ -360,3 +360,15 @@ ggml_cgraph * clip_graph_gemma4a::build() {
     ggml_build_forward_expand(gf, cur);
     return gf;
 }
+
+// Gemma4ClippableLinear: clamp input and output to trained ranges
+ggml_tensor * clip_graph_gemma4a::build_mm(ggml_tensor * w, ggml_tensor * x) const {
+    auto it = model.clamp_info_map.find(w->name);
+    if (it == model.clamp_info_map.end()) {
+        return ggml_mul_mat(ctx0, w, x);
+    }
+    const auto & ci = it->second;
+    ggml_tensor * clamped = ggml_clamp(ctx0, x, ci.inp_min, ci.inp_max);
+    ggml_tensor * out = ggml_mul_mat(ctx0, w, clamped);
+    return ggml_clamp(ctx0, out, ci.out_min, ci.out_max);
+}

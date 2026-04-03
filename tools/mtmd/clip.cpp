@@ -2207,6 +2207,27 @@ struct clip_model_loader {
                         layer.conv_pw1_w  = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "weight"));
                         layer.conv_pw2_w  = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "weight"));
                     }
+
+                    // load Gemma4ClippableLinear scalar ranges for all audio weight tensors
+                    for (auto * tensor : tensors_to_load) {
+                        std::string name = tensor->name;
+                        if (string_ends_with(name, ".weight")) {
+                            std::string name_inp_max = name;
+                            std::string name_inp_min = name;
+                            std::string name_out_max = name;
+                            std::string name_out_min = name;
+                            string_replace_all(name_inp_max, ".weight", ".input_max");
+                            string_replace_all(name_inp_min, ".weight", ".input_min");
+                            string_replace_all(name_out_max, ".weight", ".output_max");
+                            string_replace_all(name_out_min, ".weight", ".output_min");
+                            model.clamp_info_map[name] = {
+                                get_scalar(name_inp_max, FLT_MAX),
+                                get_scalar(name_inp_min, -FLT_MAX),
+                                get_scalar(name_out_max, FLT_MAX),
+                                get_scalar(name_out_min, -FLT_MAX)
+                            };
+                        }
+                    }
                 } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");

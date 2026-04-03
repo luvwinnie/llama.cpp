@@ -96,6 +96,7 @@ struct clip_graph_conformer : clip_graph {
 struct clip_graph_gemma4a : clip_graph {
     clip_graph_gemma4a(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    ggml_tensor * build_mm(ggml_tensor * w, ggml_tensor * x) const override;
 };
 
 struct clip_graph_glm4v : clip_graph {
