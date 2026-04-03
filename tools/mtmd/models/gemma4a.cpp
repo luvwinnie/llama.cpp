@@ -33,14 +33,19 @@ ggml_cgraph * clip_graph_gemma4a::build() {
         cur = ggml_relu(ctx0, cur);
     }
 
-    // flatten + input projection
-    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
-    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2]);
+    // flatten: [OW=freq, OH=seq, C=32, 1] → HF does [seq, freq, C] → [seq, freq*C]
+    // Need C fastest in dim0: permute to [C, OW=freq, OH=seq, 1] then reshape [C*freq, seq]
+    {
+        int64_t ow = cur->ne[0], oh = cur->ne[1], oc = cur->ne[2];
+        cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 2, 0, 1, 3)); // [C, freq, seq, 1]
+        cur = ggml_reshape_2d(ctx0, cur, oc * ow, oh); // [C*freq, seq]
+    }
     cur = build_mm(model.audio_inp_proj_w, cur);
 
     const int64_t S = cur->ne[1];
-    const int64_t NB = (S + CHUNK - 1) / CHUNK; // num blocks
+    const int64_t NB = (S + CHUNK - 1) / CHUNK;
     const int64_t S_PAD = NB * CHUNK;
+
 
     // Inputs
     ggml_tensor * pos_emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N_REL_POS);
