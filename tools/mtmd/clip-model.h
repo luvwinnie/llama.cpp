@@ -71,7 +71,7 @@ struct clip_hparams {
     // for models using dynamic image size, we need to have a smaller image size to warmup
     // otherwise, user will get OOM every time they load the model
     int32_t warmup_image_size = 0;
-    int32_t warmup_audio_size = 3000;
+    int32_t warmup_audio_size = 480;
 
     ffn_op_type ffn_op = FFN_GELU;
 

@@ -155,7 +155,7 @@ struct clip_ctx {
     ggml_backend_buffer_ptr buf;
 
 
-    int max_nodes = 8192;
+    int max_nodes = 65536; // increased for audio conformer per-chunk attention
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
@@ -3344,7 +3344,43 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                     set_input_f32("audio_pos_emb", pos_emb);
                 }
 
-                // Chunked attention uses zero-padding for context — no explicit mask needed
+                // Per-chunk causal-validity masks
+                {
+                    const int n_tokens = clip_n_output_tokens(ctx, imgs.entries.front().get());
+                    const int n_blocks = (n_tokens + 12 - 1) / 12;
+                    const int max_past = 12;
+                    const int chunk_sz = 12;
+                    const int ctx_sz = 24;
+
+                    // Precompute causal mask
+                    std::vector<float> causal(chunk_sz * ctx_sz, 0.0f);
+                    for (int r = 0; r < chunk_sz; r++) {
+                        for (int c = 0; c < ctx_sz; c++) {
+                            bool lower = (r <= c);
+                            bool upper = (c <= r + max_past);
+                            if (lower && upper) causal[r * ctx_sz + c] = 1.0f;
+                        }
+                    }
+
+                    for (int layer = 0; layer < ctx->model.hparams.n_layer; layer++) {
+                        for (int u = 0; u < n_blocks; u++) {
+                            std::vector<float> mask_data(ctx_sz * chunk_sz, -1e9f);
+                            for (int i = 0; i < chunk_sz; i++) {
+                                for (int j = 0; j < ctx_sz; j++) {
+                                    int actual_time = u * chunk_sz + j - max_past;
+                                    bool causal_ok = causal[i * ctx_sz + j] > 0;
+                                    bool valid_ok = actual_time >= 0 && actual_time < n_tokens;
+                                    if (causal_ok && valid_ok) {
+                                        mask_data[i * ctx_sz + j] = 0.0f;
+                                    }
+                                }
+                            }
+                            char name[64];
+                            snprintf(name, sizeof(name), "attn_mask_%d_%d", layer, u);
+                            set_input_f32(name, mask_data);
+                        }
+                    }
+                }
             } break;
         default:
             GGML_ABORT("Unknown projector type");

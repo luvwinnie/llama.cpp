@@ -1,374 +1,373 @@
+/**
+ * Gemma 4 Audio Conformer Encoder
+ * Ported from ollama model/models/gemma4/model_audio.go
+ * Reference: HF transformers modular_gemma4.py
+ */
 #include "models.h"
 #include <cmath>
-
-// Gemma 4 audio: USM conformer with chunked local attention + relative position
-// Implements HF's _convert_to_block, _extract_block_context, _rel_shift exactly
+#include <cfloat>
 
 static constexpr float SOFTCAP     = 50.0f;
-static constexpr float RESIDUAL_WT = 0.5f;
-static constexpr int   N_REL_POS   = 13;
-static constexpr int   CHUNK       = 12;
+static constexpr float RES_WEIGHT  = 0.5f;
+static constexpr float GRAD_CLIP   = 1e10f;
+static constexpr float NORM_EPS    = 1e-6f;
+static constexpr int   CHUNK_SZ    = 12;
 static constexpr int   MAX_PAST    = 12;
-static constexpr int   CTX_SIZE    = 24;  // CHUNK + MAX_PAST
+static constexpr int   CTX_SZ      = 24;
+static constexpr int   N_POS       = 13;
 
-ggml_cgraph * clip_graph_gemma4a::build() {
-    const float eps = hparams.eps;
-
-    ggml_tensor * inp = build_inp_raw(1);
-    auto * cur = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
-    cur = ggml_reshape_4d(ctx0, cur, cur->ne[0], cur->ne[1], 1, 1);
-
-    // conv subsampling with LayerNorm + ReLU
-    for (int ci = 0; ci < 2; ci++) {
-        cur = ggml_conv_2d(ctx0, model.pre_encode_conv_X_w[ci], cur, 2, 2, 1, 1, 1, 1);
-        // cur: [OW, OH, OC, 1]
-        {
-            int64_t ow = cur->ne[0], oh = cur->ne[1], oc = cur->ne[2];
-            // Flatten spatial + permute: [OW*OH, OC] then [OC, OW*OH]
-            cur = ggml_reshape_2d(ctx0, cur, ow * oh, oc);
-            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OC, OW*OH]
-            cur = ggml_norm(ctx0, cur, eps);
-            cur = ggml_mul(ctx0, cur, model.conv_norm_w_arr[ci]);
-            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OW*OH, OC]
-            cur = ggml_reshape_4d(ctx0, cur, ow, oh, oc, 1);
-        }
-        cur = ggml_relu(ctx0, cur);
-    }
-
-    // flatten: [OW=freq, OH=seq, OC=ch, 1]
-    // HF: [B,C,T,F] → permute(0,2,3,1) → [B,T,F,C] → reshape [B,T,F*C]
-    // Feature i = c*F + f → c=i//F, f=i%F
-    // ggml: [F, T, C, 1] → need [F, C, T, 1] → reshape [F*C, T]
-    // Feature i = f + c*F = c*F + f ✓ (matching HF)
-    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3)); // [F, C, T, 1]
-    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2]); // [F*C, T]
-    cur = build_mm(model.audio_inp_proj_w, cur);
-
-    const int64_t S = cur->ne[1];
-    const int64_t NB = (S + CHUNK - 1) / CHUNK;
-    const int64_t S_PAD = NB * CHUNK;
-
-
-    // Inputs
-    ggml_tensor * pos_emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N_REL_POS);
-    ggml_set_name(pos_emb, "audio_pos_emb");
-    ggml_set_input(pos_emb);
-    ggml_build_forward_expand(gf, pos_emb);
-
-    const float q_scale = (1.0f / std::sqrt((float)d_head)) / std::log(2.0f);
-    const float k_scale = std::log(1.0f + std::exp(1.0f)) / std::log(2.0f);
-
-    for (int il = 0; il < hparams.n_layer; il++) {
-        const auto & layer = model.layers[il];
-
-        // FF1 (half-step)
-        {
-            auto * res = cur;
-            auto * ff = ggml_rms_norm(ctx0, cur, eps);
-            ff = ggml_mul(ctx0, ff, layer.ff_norm_w);
-            ff = build_ffn(ff, layer.ff_up_w, nullptr, nullptr, nullptr, layer.ff_down_w, nullptr, FFN_SILU, il);
-            ff = ggml_rms_norm(ctx0, ff, eps);
-            ff = ggml_mul(ctx0, ff, layer.ff_post_norm_w);
-            cur = ggml_add(ctx0, res, ggml_scale(ctx0, ff, RESIDUAL_WT));
-        }
-
-        // === CHUNKED LOCAL ATTENTION ===
-        {
-            auto * res = cur;
-            cur = ggml_rms_norm(ctx0, cur, eps);
-            cur = ggml_mul(ctx0, cur, layer.attn_pre_norm_w);
-            // cur: [hidden, S]
-
-            // Q with per_dim_scale * q_scale
-            ggml_tensor * Q = build_mm(layer.q_w, cur); // [hidden, S]
-            {
-                Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, S);
-                auto * s = ggml_scale(ctx0, layer.per_dim_scale_w, q_scale);
-                Q = ggml_mul(ctx0, Q, s);
-            }
-            // Q: [d_head, n_head, S] → permute to [d_head, S, n_head]
-            Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-
-            // K with k_scale
-            ggml_tensor * K_raw = build_mm(layer.k_w, cur);
-            K_raw = ggml_scale(ctx0, K_raw, k_scale);
-            K_raw = ggml_reshape_3d(ctx0, K_raw, d_head, n_head, S);
-            K_raw = ggml_cont(ctx0, ggml_permute(ctx0, K_raw, 0, 2, 1, 3)); // [dh, S, nh]
-
-            // V
-            ggml_tensor * V_raw = build_mm(layer.v_w, cur);
-            V_raw = ggml_reshape_3d(ctx0, V_raw, d_head, n_head, S);
-            V_raw = ggml_cont(ctx0, ggml_permute(ctx0, V_raw, 0, 2, 1, 3)); // [dh, S, nh]
-
-            // _convert_to_block(Q): pad S to S_PAD, reshape to [dh, CHUNK, nh, NB]
-            ggml_tensor * Q_blk = Q;
-            if (S_PAD > S) {
-                Q_blk = ggml_pad(ctx0, Q_blk, 0, (int)(S_PAD - S), 0, 0); // pad dim1
-            }
-            Q_blk = ggml_reshape_4d(ctx0, Q_blk, d_head, CHUNK, n_head, NB);
-            // permute to [dh, CHUNK, nh, NB] → we want [dh, CHUNK, NB, nh] for batched matmul
-            // Actually: scores = Q_blk @ K_ctx^T per (block, head)
-            // Let's arrange: [dh, CHUNK, NB, nh] so matmul over dh gives [CHUNK, CTX, NB, nh]
-            // We need Q: [dh, CHUNK, NB*nh] and K: [dh, CTX, NB*nh]
-            // Then matmul gives [CHUNK, CTX, NB*nh]
-            // Reshape back to [CHUNK, CTX, NB, nh]
-
-            // _extract_block_context(K): pad left by MAX_PAST, right by MAX_PAST+CHUNK-1=23
-            // K: [dh, S, nh]
-            ggml_tensor * K_pad = ggml_pad(ctx0, K_raw, 0, (int)(MAX_PAST), 0, 0); // left-pad dim1
-            K_pad = ggml_pad(ctx0, K_pad, 0, (int)(CHUNK - 1), 0, 0); // right-pad by CHUNK-1
-            // K_pad: [dh, S+MAX_PAST+CHUNK-1, nh] = [dh, S+23, nh]
-            // Wait: ggml_pad pads at the END of each dimension. For left-padding we need a different approach.
-            // ggml_pad(x, p0, p1, p2, p3) pads dim0 by p0, dim1 by p1, etc — ALL AT THE END.
-            // For left-padding, we need to use ggml_pad then ggml_roll.
-
-            // Actually, left-pad dim1 by MAX_PAST: pad end by MAX_PAST, then roll by MAX_PAST
-            K_pad = ggml_pad(ctx0, K_raw, 0, (int)(MAX_PAST + CHUNK - 1), 0, 0); // pad dim1 end
-            K_pad = ggml_roll(ctx0, K_pad, 0, (int)(MAX_PAST), 0, 0); // roll dim1 to left-pad
-
-            // V same treatment
-            ggml_tensor * V_pad = ggml_pad(ctx0, V_raw, 0, (int)(MAX_PAST + CHUNK - 1), 0, 0);
-            V_pad = ggml_roll(ctx0, V_pad, 0, (int)(MAX_PAST), 0, 0);
-
-            // Now extract NB windows of size CTX_SIZE with stride CHUNK along dim1
-            // K_pad: [dh, S+MAX_PAST+CHUNK-1, nh]
-            // For block b: K_ctx[b] = K_pad[:, b*CHUNK : b*CHUNK+CTX_SIZE, :]
-            // We can do this with a strided view if ggml supports it
-            // Alternatively: reshape K_pad to [dh, NB, CTX_SIZE+overlap, nh] using view tricks
-
-            // Simpler approach: reshape K_pad to blocks using ggml_view + concat
-            // Or: use im2col-like unfolding
-            // Let's use manual extraction with views and concat
-
-            // Total padded length: S + MAX_PAST + CHUNK - 1
-            // For NB blocks with stride CHUNK and window CTX_SIZE:
-            // Block b starts at b*CHUNK, length CTX_SIZE
-            // This works if NB*CHUNK + CTX_SIZE - CHUNK <= padded_length
-            // = S_PAD + CTX_SIZE - CHUNK = S_PAD + 12 = total padded = S + 23
-
-            // Build context blocks by extracting views and concatenating
-            // K_ctx: [dh, CTX_SIZE, nh, NB]
-            ggml_tensor * k_blocks[64]; // max blocks
-            ggml_tensor * v_blocks[64];
-            GGML_ASSERT(NB <= 64);
-
-            for (int b = 0; b < NB; b++) {
-                int64_t start = b * CHUNK;
-                // K_pad dim1 view at offset start, length CTX_SIZE
-                k_blocks[b] = ggml_view_3d(ctx0, K_pad,
-                    d_head, CTX_SIZE, n_head,
-                    K_pad->nb[1], K_pad->nb[2],
-                    start * K_pad->nb[1]);
-                k_blocks[b] = ggml_cont(ctx0, k_blocks[b]);
-
-                v_blocks[b] = ggml_view_3d(ctx0, V_pad,
-                    d_head, CTX_SIZE, n_head,
-                    V_pad->nb[1], V_pad->nb[2],
-                    start * V_pad->nb[1]);
-                v_blocks[b] = ggml_cont(ctx0, v_blocks[b]);
-            }
-
-            // Stack blocks: [dh, CTX, nh] × NB → [dh, CTX, nh*NB]
-            ggml_tensor * K_ctx = k_blocks[0];
-            for (int b = 1; b < NB; b++) {
-                K_ctx = ggml_concat(ctx0, K_ctx, k_blocks[b], 2); // concat along dim2
-            }
-            // K_ctx: [dh, CTX, nh*NB]
-
-            ggml_tensor * V_ctx = v_blocks[0];
-            for (int b = 1; b < NB; b++) {
-                V_ctx = ggml_concat(ctx0, V_ctx, v_blocks[b], 2);
-            }
-
-            // Q_blk: [dh, CHUNK, nh, NB] → reshape to [dh, CHUNK, nh*NB]
-            Q_blk = ggml_reshape_3d(ctx0, Q_blk, d_head, CHUNK, n_head * NB);
-
-            // Content attention: Q_blk @ K_ctx^T
-            // Q_blk: [dh, CHUNK, nh*NB], K_ctx: [dh, CTX, nh*NB]
-            // mul_mat(K_ctx, Q_blk) → [CTX, CHUNK, nh*NB] (ggml contracts over dim0)
-            // Wait: ggml_mul_mat(a, b) = a^T @ b for each batch dim
-            // For Q=[dh, CHUNK, nh*NB] and K=[dh, CTX, nh*NB]:
-            // mul_mat(Q, K) transposes Q over dim0, giving [CHUNK, CTX, nh*NB]
-            // That's scores[chunk_q, ctx_k, batch] — wrong order
-            // We want scores[ctx_k, chunk_q, batch] so we can softmax over ctx_k
-            // So: mul_mat(K_ctx, Q_blk) → [CTX, CHUNK, nh*NB] — but we need [CHUNK, CTX, nh*NB]
-            // Actually ggml_mul_mat(a, b): result[i,j,k] = sum_d a[d,i,k] * b[d,j,k]
-            // So mul_mat(K_ctx[dh,CTX,b], Q_blk[dh,CHUNK,b]) → [CTX, CHUNK, b]
-            // For softmax over CTX (dim0), this is good!
-            ggml_tensor * ac = ggml_mul_mat(ctx0, K_ctx, Q_blk); // [CTX, CHUNK, nh*NB]
-
-            // Relative position: Q_flat @ rel_k^T → [CHUNK*NB, 13]
-            // Then _rel_shift
-            ggml_tensor * rel_k = build_mm(layer.attn_k_rel_w, pos_emb); // [hidden, 13]
-            rel_k = ggml_reshape_3d(ctx0, rel_k, d_head, n_head, N_REL_POS);
-            rel_k = ggml_cont(ctx0, ggml_permute(ctx0, rel_k, 0, 2, 1, 3)); // [dh, 13, nh]
-
-            // Use original Q for relative position (before blocking)
-            // Pad to S_PAD: [dh, S_PAD, nh]
-            ggml_tensor * Q_padded = Q;
-            if (S_PAD > S) {
-                Q_padded = ggml_pad(ctx0, Q_padded, 0, (int)(S_PAD - S), 0, 0);
-            }
-            // Q_padded: [dh, S_PAD, nh]
-            // Q @ rel_k^T: mul_mat(rel_k[dh,13,nh], Q_padded[dh,S_PAD,nh])
-            // → [13, S_PAD, nh] — score for each relative distance per query per head
-            ggml_tensor * qr = ggml_mul_mat(ctx0, rel_k, Q_padded); // [13, S_PAD, nh]
-
-            // _rel_shift: reshape qr to [NB, CHUNK, 13, nh]
-            // Then for each head: pad right to CTX+1-13=12, flatten, truncate, reshape
-            // qr: [13, S_PAD, nh] → permute to [S_PAD, 13, nh] → reshape [NB, CHUNK, 13, nh]
-            qr = ggml_cont(ctx0, ggml_permute(ctx0, qr, 1, 0, 2, 3)); // [S_PAD, 13, nh]
-            qr = ggml_reshape_4d(ctx0, qr, CHUNK, N_REL_POS, n_head, NB); // Wait, dims wrong
-            // Actually: [S_PAD, 13, nh] → reshape to [CHUNK, NB, 13, nh]
-            // S_PAD = NB * CHUNK, so first dim splits into [CHUNK, NB]
-            // But the sequence order matters! The first CHUNK elements are block 0's queries.
-            // [S_PAD, 13, nh] with S_PAD=NB*CHUNK → reshape to [CHUNK, NB, 13, nh]
-            // That's wrong — need [NB, CHUNK, 13, nh]
-            // So: reshape to [CHUNK, NB, 13, nh] then permute [1,0,2,3] → [NB, CHUNK, 13, nh]
-            qr = ggml_reshape_4d(ctx0, qr, CHUNK, NB, N_REL_POS, n_head);
-            qr = ggml_cont(ctx0, ggml_permute(ctx0, qr, 0, 2, 1, 3)); // [CHUNK, 13, NB, nh]
-            // Actually I need [NB, CHUNK, 13] per head for _rel_shift
-            // Let me work per-head by flattening nh into the batch
-
-            // Flatten: [CHUNK, 13, NB*nh]
-            qr = ggml_reshape_3d(ctx0, qr, CHUNK, N_REL_POS, NB * n_head);
-
-            // _rel_shift:
-            // 1. Pad dim1 right by CTX_SIZE+1-N_REL_POS = 12
-            qr = ggml_pad(ctx0, qr, 0, (int)(CTX_SIZE + 1 - N_REL_POS), 0, 0);
-            // qr: [CHUNK, 25, NB*nh]
-
-            // 2. Reshape to [CHUNK*(CTX_SIZE+1), NB*nh] = [300, NB*nh]
-            qr = ggml_reshape_2d(ctx0, qr, CHUNK * (CTX_SIZE + 1), NB * n_head);
-
-            // 3. Truncate to [CHUNK*CTX_SIZE, NB*nh] = [288, NB*nh]
-            qr = ggml_view_2d(ctx0, qr,
-                CHUNK * CTX_SIZE, NB * n_head,
-                qr->nb[1], 0);
-            qr = ggml_cont(ctx0, qr);
-
-            // 4. Reshape to [CTX_SIZE, CHUNK, NB*nh]
-            // Wait: HF reshapes to [NB, CHUNK, CTX_SIZE]
-            // Our flatten was [CHUNK, 25] → [CHUNK*25] → truncate to [CHUNK*24] → reshape [CHUNK, CTX]
-            // So: [CHUNK*CTX, NB*nh] → [CTX, CHUNK, NB*nh]
-            // Hmm, need to be careful with reshape order
-            // Original rel_shift: [NB, CHUNK, 25] → flatten last two → [NB, CHUNK*25] → truncate → [NB, CHUNK*24] → reshape [NB, CHUNK, 24]
-            // Our data: [CHUNK, 25, NB*nh] → reshape [CHUNK*25, NB*nh] → truncate → [CHUNK*24, NB*nh] → reshape [CHUNK, 24, NB*nh] → permute [24, CHUNK, NB*nh]
-            // Wait that gives [24, CHUNK, NB*nh] but we need [CTX, CHUNK, NB*nh]
-            // CTX=24, so [24, CHUNK, NB*nh] is correct!
-            // Reshape: [CHUNK*CTX, NB*nh] → [CHUNK, CTX, NB*nh]
-            // IMPORTANT: HF reshapes (CHUNK, CTX) not (CTX, CHUNK)!
-            qr = ggml_reshape_3d(ctx0, qr, CHUNK, CTX_SIZE, NB * n_head);
-            // Permute to [CTX, CHUNK, NB*nh] to match content scores layout
-            qr = ggml_cont(ctx0, ggml_permute(ctx0, qr, 1, 0, 2, 3));
-            // Reorder batch from NB*nh to nh*NB
-            qr = ggml_reshape_4d(ctx0, qr, CTX_SIZE, CHUNK, NB, n_head);
-            qr = ggml_cont(ctx0, ggml_permute(ctx0, qr, 0, 1, 3, 2));
-            qr = ggml_reshape_3d(ctx0, qr, CTX_SIZE, CHUNK, n_head * NB);
-
-            // Now both ac and qr: [CTX, CHUNK, nh*NB] with same batch ordering
-            ggml_tensor * scores = ggml_add(ctx0, ac, qr);
-
-            // Softcap
-            scores = ggml_scale(ctx0, scores, 1.0f / SOFTCAP);
-            scores = ggml_tanh(ctx0, scores);
-            scores = ggml_scale(ctx0, scores, SOFTCAP);
-
-            // Softmax over dim0 (CTX_SIZE)
-            scores = ggml_soft_max(ctx0, scores);
-
-            // Attention output: scores @ V_ctx
-            // scores: [CTX, CHUNK, NB*nh]
-            // V_ctx: [dh, CTX, NB*nh] — need V transposed for matmul
-            // We want: out = scores^T @ V_ctx^T ... hmm
-            // Actually: for each batch b, out[j] = sum_i scores[i,j,b] * V[d,i,b]
-            // This is: out[d,j,b] = V[d,:,b] @ scores[:,j,b]
-            // = mul_mat(scores[CTX,CHUNK,b], V_ctx[dh,CTX,b]) but mul_mat transposes first arg
-            // mul_mat(a[CTX,CHUNK,b], V[dh,CTX,b]) → [CHUNK, dh, b]... no, dim0 must match
-            // mul_mat(a, b): result[i,j,k] = sum_d a[d,i,k] * b[d,j,k]
-            // Need: sum over CTX. So CTX must be in dim0 of both.
-            // scores: [CTX, CHUNK, NB*nh] — CTX in dim0 ✓
-            // V_ctx: [dh, CTX, NB*nh] — CTX in dim1, need to permute
-            // V_ctx_t: [CTX, dh, NB*nh]
-            ggml_tensor * V_ctx_t = ggml_cont(ctx0, ggml_permute(ctx0, V_ctx, 1, 0, 2, 3));
-            // mul_mat(scores[CTX,CHUNK,b], V_ctx_t[CTX,dh,b]) → [CHUNK, dh, b]
-            ggml_tensor * attn_out = ggml_mul_mat(ctx0, scores, V_ctx_t); // [CHUNK, dh, NB*nh]
-
-            // Reshape back: [CHUNK, dh, nh*NB] → [CHUNK, dh, nh, NB]
-            attn_out = ggml_reshape_4d(ctx0, attn_out, CHUNK, d_head, n_head, NB);
-            // HF: [batch, NB, CHUNK, heads, d_head] → [batch, NB*CHUNK, heads*d_head]
-            // Need [dh, nh, CHUNK, NB] so flatten gives [dh*nh=hidden, CHUNK*NB=seq]
-            attn_out = ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 1, 2, 0, 3)); // [dh, nh, CHUNK, NB]
-            attn_out = ggml_reshape_2d(ctx0, attn_out, d_head * n_head, CHUNK * NB); // [hidden, S_PAD]
-
-            // Truncate to original seq length
-            if (S_PAD > S) {
-                attn_out = ggml_view_2d(ctx0, attn_out, n_embd, S, attn_out->nb[1], 0);
-                attn_out = ggml_cont(ctx0, attn_out);
-            }
-
-            // Output projection + post-norm
-            ggml_tensor * out = build_mm(layer.o_w, attn_out);
-            out = ggml_rms_norm(ctx0, out, eps);
-            out = ggml_mul(ctx0, out, layer.attn_post_norm_w);
-            cur = ggml_add(ctx0, res, out);
-        }
-
-        // LightConv1d
-        {
-            auto * res = cur;
-            cur = ggml_rms_norm(ctx0, cur, eps);
-            cur = ggml_mul(ctx0, cur, layer.norm_conv_w);
-            auto * x = build_mm(layer.conv_pw1_w, cur);
-            {
-                int64_t dd = x->ne[0] / 2;
-                auto * gate = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, x, dd, x->ne[1], x->nb[1], dd * x->nb[0]));
-                x = ggml_mul(ctx0, ggml_view_2d(ctx0, x, dd, x->ne[1], x->nb[1], 0), gate);
-                x = ggml_cont(ctx0, ggml_transpose(ctx0, x));
-            }
-            x = ggml_pad(ctx0, x, 4, 0, 0, 0);
-            x = ggml_ssm_conv(ctx0, x, layer.conv_dw_w);
-            x = ggml_rms_norm(ctx0, x, eps);
-            x = ggml_mul(ctx0, x, layer.conv_norm_w);
-            x = ggml_silu(ctx0, x);
-            x = build_mm(layer.conv_pw2_w, x);
-            cur = ggml_add(ctx0, res, x);
-        }
-
-        // FF2 (half-step)
-        {
-            auto * res = cur;
-            auto * ff = ggml_rms_norm(ctx0, cur, eps);
-            ff = ggml_mul(ctx0, ff, layer.ff_norm_1_w);
-            ff = build_ffn(ff, layer.ff_up_1_w, nullptr, nullptr, nullptr, layer.ff_down_1_w, nullptr, FFN_SILU, il);
-            ff = ggml_rms_norm(ctx0, ff, eps);
-            ff = ggml_mul(ctx0, ff, layer.ff_post_norm_1_w);
-            cur = ggml_add(ctx0, res, ggml_scale(ctx0, ff, RESIDUAL_WT));
-        }
-
-        cur = ggml_rms_norm(ctx0, cur, eps);
-        cur = ggml_mul(ctx0, cur, layer.ln_2_w);
-    }
-
-    cur = build_mm(model.pre_encode_out_w, cur);
-    cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
-    // embed_audio: parameterless RMSNorm → Linear (matching HF exactly)
-    cur = ggml_rms_norm(ctx0, cur, 1e-6f);
-    cur = build_mm(model.mm_audio_inp_proj_w, cur);
-    cb(cur, "projected", -1);
-
-    ggml_build_forward_expand(gf, cur);
-    return gf;
-}
-
-// Gemma4ClippableLinear: clamp input and output to trained ranges
+// Gemma4ClippableLinear: clamp input/output
 ggml_tensor * clip_graph_gemma4a::build_mm(ggml_tensor * w, ggml_tensor * x) const {
     auto it = model.clamp_info_map.find(w->name);
     if (it == model.clamp_info_map.end()) {
         return ggml_mul_mat(ctx0, w, x);
     }
     const auto & ci = it->second;
-    ggml_tensor * clamped = ggml_clamp(ctx0, x, ci.inp_min, ci.inp_max);
-    ggml_tensor * out = ggml_mul_mat(ctx0, w, clamped);
-    return ggml_clamp(ctx0, out, ci.out_min, ci.out_max);
+    if (ci.inp_max < FLT_MAX) x = ggml_clamp(ctx0, x, ci.inp_min, ci.inp_max);
+    ggml_tensor * out = ggml_mul_mat(ctx0, w, x);
+    if (ci.out_max < FLT_MAX) out = ggml_clamp(ctx0, out, ci.out_min, ci.out_max);
+    return out;
+}
+
+ggml_cgraph * clip_graph_gemma4a::build() {
+    ggml_tensor * inp = build_inp_raw(1);
+
+    // inp: [nx=frames, ny=mel, 1] → transpose to [mel, frames] for conv2d
+    auto * cur = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+    cur = ggml_reshape_4d(ctx0, cur, cur->ne[0], cur->ne[1], 1, 1);
+
+    // ── Conv2d subsampling ──
+    // Two conv blocks: conv2d → LayerNorm(channels) → ReLU
+    // Ollama: permute(1,2,0,3) to get channels in ne[0], norm, permute(2,0,1,3) back
+    for (int ci = 0; ci < 2; ci++) {
+        cur = ggml_conv_2d(ctx0, model.pre_encode_conv_X_w[ci], cur, 2, 2, 1, 1, 1, 1);
+        // cur: [OW=freq', OH=time', OC=channels, 1]
+        if (model.conv_norm_w_arr[ci]) {
+            // LayerNorm over channels: flatten spatial, put channels in ne[0]
+            int64_t ow = cur->ne[0], oh = cur->ne[1], oc = cur->ne[2];
+            cur = ggml_reshape_2d(ctx0, cur, ow * oh, oc);
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [OC, spatial]
+            cur = ggml_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, model.conv_norm_w_arr[ci]);
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3)); // [spatial, OC]
+            cur = ggml_reshape_4d(ctx0, cur, ow, oh, oc, 1);
+        }
+        cur = ggml_relu(ctx0, cur);
+    }
+
+    // ── Flatten for linear projection ──
+    // cur: [OW=F, OH=T, OC=C, 1]
+    // HF: permute(0,2,3,1) → [B,T,F,C] → reshape [B,T,F*C]
+    // Feature i = f*C + c (freq slowest, channel fastest? No: f varies over F, c over C)
+    // In HF [T,F,C], reshape to [T, F*C]: feat index = f*C + c
+    // In ggml [F,T,C,1]: to match, need [F,C,T,1] → reshape [F*C, T]
+    // = ggml permute(0,2,1,3) on [F,T,C,1] → [F,C,T,1]
+    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3)); // [F, C, T, 1]
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2]); // [F*C, T]
+
+    // Input projection
+    cur = build_mm(model.audio_inp_proj_w, cur); // [1024, T]
+
+    const int64_t S = cur->ne[1]; // sequence length
+
+    // ── Conformer blocks ──
+    for (int il = 0; il < hparams.n_layer; il++) {
+        const auto & layer = model.layers[il];
+
+        // ── FFW 1 (half-residual) ──
+        {
+            auto * res = cur;
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.ff_norm_w);
+            cur = build_mm(layer.ff_up_w, cur);
+            cur = ggml_silu(ctx0, cur);
+            cur = build_mm(layer.ff_down_w, cur);
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.ff_post_norm_w);
+            cur = ggml_scale(ctx0, cur, RES_WEIGHT);
+            cur = ggml_add(ctx0, res, cur);
+        }
+
+        // ── Self-Attention (per-chunk loop, matching ollama) ──
+        {
+            auto * res = cur;
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.attn_pre_norm_w);
+
+            // QKV: [hidden, S]
+            ggml_tensor * Q = build_mm(layer.q_w, cur);
+            ggml_tensor * K = build_mm(layer.k_w, cur);
+            ggml_tensor * V = build_mm(layer.v_w, cur);
+
+            // Reshape to [d_head, n_head, S]
+            Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, S);
+            K = ggml_reshape_3d(ctx0, K, d_head, n_head, S);
+            V = ggml_reshape_3d(ctx0, V, d_head, n_head, S);
+
+            // Q scaling: q_scale * per_dim_scale (already softplus'd)
+            const float q_scale = (1.0f / std::sqrt((float)d_head)) / std::log(2.0f);
+            Q = ggml_scale(ctx0, Q, q_scale);
+            if (layer.per_dim_scale_w) {
+                Q = ggml_mul(ctx0, Q, layer.per_dim_scale_w); // [d_head] broadcasts
+            }
+
+            // K scaling
+            const float k_scale = std::log(1.0f + std::exp(1.0f)) / std::log(2.0f);
+            K = ggml_scale(ctx0, K, k_scale);
+
+            // Permute to [d_head, S, n_head] for easier blocking
+            Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+            K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+            V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+            // Build sinusoidal position embeddings: [hidden, N_POS]
+            ggml_tensor * pos_emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N_POS);
+            ggml_set_name(pos_emb, "audio_pos_emb");
+            ggml_set_input(pos_emb);
+            if (il == 0) ggml_build_forward_expand(gf, pos_emb);
+
+            // Project position embeddings through attn_k_rel (linear_pos)
+            ggml_tensor * pos_proj = build_mm(layer.attn_k_rel_w, pos_emb); // [hidden, N_POS]
+            pos_proj = ggml_reshape_3d(ctx0, pos_proj, d_head, n_head, N_POS);
+            // Permute to [d_head, N_POS, n_head]
+            pos_proj = ggml_cont(ctx0, ggml_permute(ctx0, pos_proj, 0, 2, 1, 3));
+
+            // Pad Q to multiple of CHUNK_SZ
+            int64_t n_blocks = (S + CHUNK_SZ - 1) / CHUNK_SZ;
+            int64_t S_pad = n_blocks * CHUNK_SZ;
+            int64_t pad_t = S_pad - S;
+            if (pad_t > 0) {
+                Q = ggml_pad(ctx0, Q, 0, (int)pad_t, 0, 0);
+                K = ggml_pad(ctx0, K, 0, (int)pad_t, 0, 0);
+                V = ggml_pad(ctx0, V, 0, (int)pad_t, 0, 0);
+            }
+
+            // Pad K,V for context: left by MAX_PAST, right by CHUNK_SZ-1
+            // Use pad+roll for left padding (ggml_pad only pads right)
+            K = ggml_pad(ctx0, K, 0, MAX_PAST + CHUNK_SZ - 1, 0, 0);
+            K = ggml_roll(ctx0, K, 0, MAX_PAST, 0, 0);
+            V = ggml_pad(ctx0, V, 0, MAX_PAST + CHUNK_SZ - 1, 0, 0);
+            V = ggml_roll(ctx0, V, 0, MAX_PAST, 0, 0);
+
+            // Reshape Q into chunks: [d_head, CHUNK_SZ, n_head, n_blocks]
+            ggml_tensor * Q_chunked = ggml_reshape_4d(ctx0, Q, d_head, CHUNK_SZ, n_head, n_blocks);
+
+            // Per-chunk attention loop (matching ollama exactly)
+            ggml_tensor * chunk_outs[128]; // max blocks
+            GGML_ASSERT(n_blocks <= 128);
+
+            for (int u = 0; u < n_blocks; u++) {
+                // Extract Q block: [d_head, CHUNK_SZ, n_head]
+                ggml_tensor * q_blk = ggml_view_3d(ctx0, Q_chunked,
+                    d_head, CHUNK_SZ, n_head,
+                    Q_chunked->nb[1], Q_chunked->nb[2],
+                    u * Q_chunked->nb[3]);
+                q_blk = ggml_cont(ctx0, q_blk);
+
+                // Extract K,V context: [d_head, CTX_SZ, n_head]
+                int64_t c_start = u * CHUNK_SZ;
+                ggml_tensor * k_ctx = ggml_view_3d(ctx0, K,
+                    d_head, CTX_SZ, n_head,
+                    K->nb[1], K->nb[2],
+                    c_start * K->nb[1]);
+                k_ctx = ggml_cont(ctx0, k_ctx);
+
+                ggml_tensor * v_ctx = ggml_view_3d(ctx0, V,
+                    d_head, CTX_SZ, n_head,
+                    V->nb[1], V->nb[2],
+                    c_start * V->nb[1]);
+                v_ctx = ggml_cont(ctx0, v_ctx);
+
+                // Permute for matmul: [d_head, X, n_head] → [d_head, X, n_head]
+                // Already in right layout for batched matmul over n_head
+
+                // Content logits: k_ctx^T @ q_blk = [CTX_SZ, CHUNK_SZ, n_head]
+                auto * qP = ggml_cont(ctx0, ggml_permute(ctx0, q_blk, 0, 2, 1, 3)); // [dh, nh, chunk]
+                auto * kP = ggml_cont(ctx0, ggml_permute(ctx0, k_ctx, 0, 2, 1, 3)); // [dh, nh, ctx]
+
+                // Wait: ollama does qP=[dh,chunk,nh], kP=[dh,ctx,nh] then kP.Mulmat(qP)=[ctx,chunk,nh]
+                // In ggml: mul_mat(a,b) contracts over ne[0]. Need ne[0]=dh for both.
+                // q_blk: [dh, CHUNK, nh], k_ctx: [dh, CTX, nh]
+                // mul_mat(k_ctx, q_blk) = [CTX, CHUNK, nh] ← correct!
+                auto * term_ac = ggml_mul_mat(ctx0, k_ctx, q_blk); // [CTX, CHUNK, nh]
+
+                // Position logits: pos_proj^T @ q_blk = [N_POS, CHUNK, nh]
+                auto * term_bd_raw = ggml_mul_mat(ctx0, pos_proj, q_blk); // [N_POS, CHUNK, nh]
+
+                // Relative shift: [N_POS, CHUNK, nh] → [CTX_SZ, CHUNK, nh]
+                {
+                    int pad_amt = CTX_SZ + 1 - N_POS; // 12
+                    if (pad_amt > 0) {
+                        term_bd_raw = ggml_pad(ctx0, term_bd_raw, pad_amt, 0, 0, 0);
+                    }
+                    // [CTX+1, CHUNK, nh] → reshape [(CTX+1)*CHUNK, nh]
+                    term_bd_raw = ggml_reshape_2d(ctx0, term_bd_raw, (CTX_SZ + 1) * CHUNK_SZ, n_head);
+                    // Slice first CTX*CHUNK elements
+                    term_bd_raw = ggml_view_2d(ctx0, term_bd_raw,
+                        CTX_SZ * CHUNK_SZ, n_head,
+                        term_bd_raw->nb[1], 0);
+                    term_bd_raw = ggml_cont(ctx0, term_bd_raw);
+                    // Reshape to [CTX, CHUNK, nh]
+                    term_bd_raw = ggml_reshape_3d(ctx0, term_bd_raw, CTX_SZ, CHUNK_SZ, n_head);
+                }
+
+                // Combined logits
+                auto * logits = ggml_add(ctx0, term_ac, term_bd_raw);
+
+                // Softcap
+                logits = ggml_scale(ctx0, logits, 1.0f / SOFTCAP);
+                logits = ggml_tanh(ctx0, logits);
+                logits = ggml_scale(ctx0, logits, SOFTCAP);
+
+                // Causal-validity mask
+                ggml_tensor * mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, CTX_SZ, CHUNK_SZ, 1);
+                {
+                    char name[64];
+                    snprintf(name, sizeof(name), "attn_mask_%d_%d", il, u);
+                    ggml_set_name(mask, name);
+                    ggml_set_input(mask);
+                    if (il == 0) ggml_build_forward_expand(gf, mask);
+                }
+                logits = ggml_add(ctx0, logits, mask);
+
+                // Softmax over CTX dimension (ne[0])
+                logits = ggml_soft_max(ctx0, logits);
+
+                // Weighted sum: v_ctx^T @ logits
+                // v_ctx: [dh, CTX, nh] → permute to [CTX, dh, nh]
+                auto * v_t = ggml_cont(ctx0, ggml_permute(ctx0, v_ctx, 1, 0, 2, 3)); // [CTX, dh, nh]
+                auto * chunk_out = ggml_mul_mat(ctx0, v_t, logits); // [dh, CHUNK, nh]
+
+                // Permute to [dh, nh, CHUNK]
+                chunk_out = ggml_cont(ctx0, ggml_permute(ctx0, chunk_out, 0, 2, 1, 3));
+                chunk_outs[u] = chunk_out;
+            }
+
+            // Concatenate chunks along time dimension (dim 2)
+            ggml_tensor * attn_out = chunk_outs[0];
+            for (int u = 1; u < n_blocks; u++) {
+                attn_out = ggml_concat(ctx0, attn_out, chunk_outs[u], 2);
+            }
+
+            // Trim to original seq length
+            if (S_pad > S) {
+                attn_out = ggml_view_3d(ctx0, attn_out,
+                    d_head, n_head, S,
+                    attn_out->nb[1], attn_out->nb[2], 0);
+                attn_out = ggml_cont(ctx0, attn_out);
+            }
+
+            // Reshape to [hidden, S]
+            attn_out = ggml_reshape_2d(ctx0, attn_out, d_head * n_head, S);
+
+            // Output projection
+            cur = build_mm(layer.o_w, attn_out);
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.attn_post_norm_w);
+            cur = ggml_add(ctx0, res, cur);
+        }
+
+        // ── Light Conv1d ──
+        {
+            auto * res = cur;
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.norm_conv_w);
+
+            cur = build_mm(layer.conv_pw1_w, cur); // [2*hidden, S]
+
+            // GLU: split and gate
+            {
+                int64_t d = cur->ne[0] / 2;
+                auto * data_part = ggml_view_2d(ctx0, cur, d, cur->ne[1], cur->nb[1], 0);
+                auto * gate_part = ggml_view_2d(ctx0, cur, d, cur->ne[1], cur->nb[1], d * cur->nb[0]);
+                gate_part = ggml_sigmoid(ctx0, gate_part);
+                cur = ggml_mul(ctx0, data_part, gate_part);
+            }
+
+            // Manual depthwise conv (kernel_size=5, causal)
+            // cur: [hidden, S] — need per-tap shifted copies
+            {
+                int kernel_size = 5;
+                ggml_tensor * conv_out = nullptr;
+                // Transpose kernel [K, D] → [D, K] for per-tap slicing
+                auto * kern_t = ggml_cont(ctx0, ggml_permute(ctx0, layer.conv_dw_w, 1, 0, 2, 3)); // [D, K]
+
+                for (int k = 0; k < kernel_size; k++) {
+                    int shift = kernel_size - 1 - k; // causal shift
+                    ggml_tensor * shifted;
+                    if (shift == 0) {
+                        shifted = cur;
+                    } else {
+                        // Trim last 'shift' time steps, left-pad with zeros
+                        auto * trimmed = ggml_view_2d(ctx0, cur,
+                            cur->ne[0], cur->ne[1] - shift,
+                            cur->nb[1], 0);
+                        trimmed = ggml_cont(ctx0, trimmed);
+                        shifted = ggml_pad(ctx0, trimmed, 0, shift, 0, 0);
+                        // Roll to left-pad
+                        shifted = ggml_roll(ctx0, shifted, 0, shift, 0, 0);
+                    }
+
+                    // Extract tap weight: [D, 1]
+                    auto * wk = ggml_view_2d(ctx0, kern_t,
+                        kern_t->ne[0], 1,
+                        kern_t->nb[1], k * kern_t->nb[1]);
+                    wk = ggml_cont(ctx0, wk);
+
+                    auto * term = ggml_mul(ctx0, shifted, wk); // [D, S] * [D, 1] broadcast
+                    if (conv_out == nullptr) {
+                        conv_out = term;
+                    } else {
+                        conv_out = ggml_add(ctx0, conv_out, term);
+                    }
+                }
+                cur = conv_out;
+            }
+
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.conv_norm_w);
+            cur = ggml_silu(ctx0, cur);
+
+            cur = build_mm(layer.conv_pw2_w, cur);
+            cur = ggml_add(ctx0, res, cur);
+        }
+
+        // ── FFW 2 (half-residual) ──
+        {
+            auto * res = cur;
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.ff_norm_1_w);
+            cur = build_mm(layer.ff_up_1_w, cur);
+            cur = ggml_silu(ctx0, cur);
+            cur = build_mm(layer.ff_down_1_w, cur);
+            cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+            cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+            cur = ggml_mul(ctx0, cur, layer.ff_post_norm_1_w);
+            cur = ggml_scale(ctx0, cur, RES_WEIGHT);
+            cur = ggml_add(ctx0, res, cur);
+        }
+
+        // ── Final norm ──
+        cur = ggml_clamp(ctx0, cur, -GRAD_CLIP, GRAD_CLIP);
+        cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+        cur = ggml_mul(ctx0, cur, layer.ln_2_w);
+    }
+
+    // Output projection: 1024 → 1536
+    cur = build_mm(model.pre_encode_out_w, cur);
+    cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
+
+    // embed_audio: RMSNorm (no weight) + linear projection
+    cur = ggml_rms_norm(ctx0, cur, NORM_EPS);
+    cur = build_mm(model.mm_audio_inp_proj_w, cur);
+
+    cb(cur, "projected", -1);
+    ggml_build_forward_expand(gf, cur);
+    return gf;
 }
