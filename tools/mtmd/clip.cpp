@@ -1531,8 +1531,17 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
+        // Dedup map: prevent duplicate tensor allocation (critical for audio models
+        // where the same tensor name may be requested multiple times)
+        std::map<std::string, ggml_tensor *> data_tensors;
+
         // helper function
         auto get_tensor = [&](const std::string & name, bool required = true) {
+            // Return existing tensor if already created (dedup fix)
+            auto it = data_tensors.find(name);
+            if (it != data_tensors.end()) {
+                return it->second;
+            }
             ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), name.c_str());
             if (!cur && required) {
                 throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
@@ -1542,6 +1551,7 @@ struct clip_model_loader {
                 // add tensors to context
                 ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
                 ggml_set_name(data_tensor, cur->name);
+                data_tensors[name] = data_tensor;
                 cur = data_tensor;
             }
             return cur;
