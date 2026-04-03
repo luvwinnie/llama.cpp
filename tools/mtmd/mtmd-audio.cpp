@@ -737,18 +737,88 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
     GGML_ASSERT(!cache.cos_vals.empty());
     GGML_ASSERT(!cache.filters.data.empty());
 
-    // Semicausal padding: prepend frame_length/2 = 160 zeros
-    const int pad_left = hparams.audio_window_len / 2;
-    std::vector<float> padded_samples(pad_left + n_samples, 0.0f);
-    std::copy(samples, samples + n_samples, padded_samples.begin() + pad_left);
+    // Gemma 4: custom mel extraction matching HF exactly
+    // DO NOT use shared log_mel_spectrogram (it adds whisper-style padding)
+    const int frame_length = hparams.audio_window_len; // 320
+    const int hop_length   = hparams.audio_hop_len;    // 160
+    const int n_fft        = hparams.audio_n_fft;      // 512
+    const int n_mel        = hparams.n_mel_bins;        // 128
+    const int n_fft_bins   = n_fft / 2 + 1;            // 257
+    const float mel_floor  = 0.001f;
 
-    mtmd_audio_mel out_full;
-    bool ok = log_mel_spectrogram(padded_samples.data(), padded_samples.size(), 4, params, cache, out_full);
-    if (!ok) {
+    // 1. Semicausal padding: prepend frame_length/2 zeros
+    const int pad_left = frame_length / 2;
+    std::vector<float> padded(pad_left + n_samples, 0.0f);
+    std::copy(samples, samples + n_samples, padded.begin() + pad_left);
+
+    // 2. Frame extraction: size = frame_length+1 = 321, step = hop_length
+    // Then take first frame_length samples (matching HF's [:-1])
+    const int frame_unfold = frame_length + 1;
+    if ((int)padded.size() < frame_unfold) {
         return false;
     }
+    const int n_frames = ((int)padded.size() - frame_unfold) / hop_length + 1;
 
-    output.push_back(std::move(out_full));
+    // 3. Get Hann window and mel filters from cache
+    const float * hann = cache.hann_window.data();
+    const float * mel_filters = cache.filters.data.data();
+
+    // Allocate output
+    mtmd_audio_mel out_mel;
+    out_mel.n_mel     = n_mel;
+    out_mel.n_len     = n_frames;
+    out_mel.n_len_org = n_frames;
+    out_mel.data.resize(n_mel * n_frames);
+
+    // 4. Process each frame
+    std::vector<float> fft_in(n_fft * 2, 0.0f);
+    std::vector<float> fft_out(n_fft * 2 * 4, 0.0f);
+
+    for (int fi = 0; fi < n_frames; fi++) {
+        const int start = fi * hop_length;
+
+        // Window: apply Hann to first frame_length samples, zero-pad to n_fft
+        std::fill(fft_in.begin(), fft_in.end(), 0.0f);
+        for (int j = 0; j < frame_length && (start + j) < (int)padded.size(); j++) {
+            fft_in[j] = hann[j] * padded[start + j];
+        }
+
+        // DFT (direct computation for correctness — matches numpy.fft.rfft exactly)
+        // Only compute first n_fft/2+1 bins (real FFT)
+        std::vector<float> magnitude(n_fft_bins);
+        for (int k = 0; k < n_fft_bins; k++) {
+            float re = 0.0f, im = 0.0f;
+            for (int n = 0; n < n_fft; n++) {
+                float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)n_fft;
+                re += fft_in[n] * cosf(angle);
+                im -= fft_in[n] * sinf(angle);
+            }
+            magnitude[k] = std::sqrt(re * re + im * im);
+        }
+
+        // Mel filterbank + log with additive floor
+        for (int m = 0; m < n_mel; m++) {
+            float sum = 0.0f;
+            for (int k = 0; k < n_fft_bins; k++) {
+                sum += magnitude[k] * mel_filters[m * n_fft_bins + k];
+            }
+            out_mel.data[m * n_frames + fi] = std::log(sum + mel_floor);
+        }
+    }
+
+    // Debug: print first audio samples and mel values
+    fprintf(stderr, "GEMMA4A: n_samples=%zu, padded=%zu, n_frames=%d\n", n_samples, padded.size(), n_frames);
+    fprintf(stderr, "GEMMA4A SAMPLES [pad_left:pad_left+5]: %.8f %.8f %.8f %.8f %.8f\n",
+        padded[pad_left], padded[pad_left+1], padded[pad_left+2], padded[pad_left+3], padded[pad_left+4]);
+    fprintf(stderr, "GEMMA4A MEL: n_frames=%d, n_mel=%d\n", n_frames, n_mel);
+    fprintf(stderr, "GEMMA4A MEL [0,0:5]: %.4f %.4f %.4f %.4f %.4f\n",
+        out_mel.data[0*n_frames+0], out_mel.data[1*n_frames+0], out_mel.data[2*n_frames+0],
+        out_mel.data[3*n_frames+0], out_mel.data[4*n_frames+0]);
+    fprintf(stderr, "GEMMA4A MEL [1,0:5]: %.4f %.4f %.4f %.4f %.4f\n",
+        out_mel.data[0*n_frames+1], out_mel.data[1*n_frames+1], out_mel.data[2*n_frames+1],
+        out_mel.data[3*n_frames+1], out_mel.data[4*n_frames+1]);
+
+    output.push_back(std::move(out_mel));
     return true;
 }
 
