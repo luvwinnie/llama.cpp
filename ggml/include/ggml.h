@@ -439,7 +439,8 @@ extern "C" {
         GGML_TYPE_TURBO3_0 = 49, // TurboQuant 3-bit WHT (32-element blocks)
         GGML_TYPE_TURBO2_0 = 50, // TurboQuant 2-bit WHT (32-element blocks)
         GGML_TYPE_TURBO4_0 = 51, // TurboQuant 4-bit WHT pure PolarQuant (32-element blocks, 16 centroids)
-        GGML_TYPE_COUNT    = 52,
+        GGML_TYPE_TQ4_1S  = 52, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_COUNT    = 53,
     };
 
     // precision

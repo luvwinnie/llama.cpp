@@ -5879,6 +5879,202 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
+// ===================== TQ4_1S: WHT-rotated 4-bit weight quantization =====================
+
+// Lloyd-Max centroids for N(0,1) -- 16-level
+static const float TQ4_0_CENTROIDS[16] = {
+    -2.732590f, -2.069017f, -1.618046f, -1.256231f,
+    -0.942340f, -0.656759f, -0.388048f, -0.128395f,
+     0.128395f,  0.388048f,  0.656759f,  0.942340f,
+     1.256231f,  1.618046f,  2.069017f,  2.732590f,
+};
+
+// WHT sign pattern (golden ratio hash, 32-element blocks)
+static const float TQ3_0_SIGNS[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+};
+
+#define TQ_BLOCK_SIZE 32
+#define TQ_INV_SQRT32 0.17677669529663688f  /* 1/sqrt(32) */
+
+/* Forward RHT: sign flips -> WHT butterfly -> normalize */
+static void tq3_0_rht_forward(float * buf) {
+    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ3_0_SIGNS[i];
+    for (int step = 1; step < TQ_BLOCK_SIZE; step <<= 1) {
+        for (int i = 0; i < TQ_BLOCK_SIZE; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j], b = buf[j + step];
+                buf[j]     = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ_INV_SQRT32;
+}
+
+/* Inverse RHT: WHT butterfly -> normalize + unsign */
+static void tq3_0_rht_inverse(float * buf) {
+    for (int step = 1; step < TQ_BLOCK_SIZE; step <<= 1) {
+        for (int i = 0; i < TQ_BLOCK_SIZE; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j], b = buf[j + step];
+                buf[j]     = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < TQ_BLOCK_SIZE; i++) buf[i] *= TQ_INV_SQRT32 * TQ3_0_SIGNS[i];
+}
+
+/* Nearest centroid for TQ4 (16 centroids) */
+static int tq4_0_choose_index(float val) {
+    if (val < -2.400804f) return 0;
+    if (val < -1.843532f) return 1;
+    if (val < -1.437139f) return 2;
+    if (val < -1.099286f) return 3;
+    if (val < -0.799550f) return 4;
+    if (val < -0.522404f) return 5;
+    if (val < -0.258222f) return 6;
+    if (val <  0.000000f) return 7;
+    if (val <  0.258222f) return 8;
+    if (val <  0.522404f) return 9;
+    if (val <  0.799550f) return 10;
+    if (val <  1.099286f) return 11;
+    if (val <  1.437139f) return 12;
+    if (val <  1.843532f) return 13;
+    if (val <  2.400804f) return 14;
+    return 15;
+}
+
+void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ4_1S == 0);
+    const int nb = k / QK_TQ4_1S;
+
+    for (int block = 0; block < nb; block++) {
+        const float * src_blk = x + block * QK_TQ4_1S;
+        block_tq4_1s * blk = &y[block];
+
+        /* 1. Forward RHT */
+        float buf[TQ_BLOCK_SIZE];
+        memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
+        tq3_0_rht_forward(buf);
+
+        /* 2. Split into two halves, compute RMS per half */
+        float rms0 = 0.0f, rms1 = 0.0f;
+        for (int j = 0; j < 16; j++) rms0 += buf[j] * buf[j];
+        for (int j = 16; j < 32; j++) rms1 += buf[j] * buf[j];
+        rms0 = sqrtf(rms0 / 16.0f);
+        rms1 = sqrtf(rms1 / 16.0f);
+
+        /* 3. Scale search (9 points) */
+        static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
+        float best_d0 = rms0, best_d1 = rms1;
+        float best_err = 1e30f;
+
+        for (int si = 0; si < 9; si++) {
+            float d0 = rms0 * scales[si];
+            float d1 = rms1 * scales[si];
+            float inv0 = (d0 > 1e-10f) ? 1.0f / d0 : 0.0f;
+            float inv1 = (d1 > 1e-10f) ? 1.0f / d1 : 0.0f;
+
+            float err = 0.0f;
+            for (int j = 0; j < 16; j++) {
+                int idx = tq4_0_choose_index(buf[j] * inv0);
+                float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d0;
+                err += diff * diff;
+            }
+            for (int j = 16; j < 32; j++) {
+                int idx = tq4_0_choose_index(buf[j] * inv1);
+                float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d1;
+                err += diff * diff;
+            }
+            if (err < best_err) {
+                best_err = err;
+                best_d0 = d0;
+                best_d1 = d1;
+            }
+        }
+
+        /* 4. Iterative refinement (6 iterations) */
+        for (int iter = 0; iter < 6; iter++) {
+            float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
+            float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
+
+            float num0 = 0.0f, den0 = 0.0f;
+            float num1 = 0.0f, den1 = 0.0f;
+            for (int j = 0; j < 16; j++) {
+                int idx = tq4_0_choose_index(buf[j] * inv0);
+                float c = TQ4_0_CENTROIDS[idx];
+                num0 += buf[j] * c;
+                den0 += c * c;
+            }
+            for (int j = 16; j < 32; j++) {
+                int idx = tq4_0_choose_index(buf[j] * inv1);
+                float c = TQ4_0_CENTROIDS[idx];
+                num1 += buf[j] * c;
+                den1 += c * c;
+            }
+            if (den0 > 1e-10f) best_d0 = num0 / den0;
+            if (den1 > 1e-10f) best_d1 = num1 / den1;
+        }
+
+        /* 5. Final quantize + pack (nibble packing) */
+        float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
+        float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
+
+        blk->d0 = GGML_FP32_TO_FP16(best_d0);
+        blk->d1 = GGML_FP32_TO_FP16(best_d1);
+        memset(blk->qs, 0, QK_TQ4_1S / 2);
+
+        for (int j = 0; j < QK_TQ4_1S; j++) {
+            float inv = (j < 16) ? inv0 : inv1;
+            int idx = tq4_0_choose_index(buf[j] * inv);
+            blk->qs[j / 2] |= (uint8_t)((idx & 0xF) << ((j & 1) * 4));
+        }
+    }
+}
+
+void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ4_1S == 0);
+    const int nb = k / QK_TQ4_1S;
+
+    for (int blk_i = 0; blk_i < nb; blk_i++) {
+        float d0 = GGML_FP16_TO_FP32(x[blk_i].d0);
+        float d1 = GGML_FP16_TO_FP32(x[blk_i].d1);
+
+        float buf[32];
+        for (int j = 0; j < 32; j++) {
+            uint8_t idx = (x[blk_i].qs[j / 2] >> ((j & 1) * 4)) & 0xF;
+            float d = (j < 16) ? d0 : d1;
+            buf[j] = TQ4_0_CENTROIDS[idx] * d;
+        }
+
+        /* Inverse RHT */
+        tq3_0_rht_inverse(buf);
+
+        memcpy(y + blk_i * QK_TQ4_1S, buf, QK_TQ4_1S * sizeof(float));
+    }
+}
+
+size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TQ4_1S == 0);
+
+    size_t row_size = (n_per_row / QK_TQ4_1S) * sizeof(block_tq4_1s);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_tq4_1s_ref(
+            src + row * n_per_row,
+            (block_tq4_1s *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
@@ -6068,6 +6264,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ4_1S:
+            {
+                const block_tq4_1s * q = (const block_tq4_1s *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d0, i)) {
+                        return false;
+                    }
+                    if (!validate_fp16(q[i].d1, i)) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_IQ1_S:
             {
