@@ -762,7 +762,7 @@ static void foreach_parameter(const json &                                      
     }
 }
 
-std::string common_chat_template_direct_apply(
+static std::string common_chat_template_direct_apply_full(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override,
@@ -812,6 +812,12 @@ std::string common_chat_template_direct_apply(
         result = result.substr(0, result.size() - tmpl.eos_token().size());
     }
     return result;
+}
+
+std::string common_chat_template_direct_apply(
+    const common_chat_template & tmpl,
+    const autoparser::generation_params & inputs) {
+    return common_chat_template_direct_apply_full(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
 }
 
 static common_chat_params common_chat_params_init_ministral_3(const common_chat_template &    tmpl,
@@ -864,7 +870,7 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     data.supports_thinking  = true;
     data.thinking_start_tag = "[THINK]";
     data.thinking_end_tag   = "[/THINK]";
-    data.prompt            = common_chat_template_direct_apply(tmpl, inputs, /* messages_override = */ adjusted_messages);
+    data.prompt            = common_chat_template_direct_apply_full(tmpl, inputs, /* messages_override = */ adjusted_messages, std::nullopt, std::nullopt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = {
         "[THINK]",
@@ -947,7 +953,7 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         adjusted_messages.push_back(msg);
     }
 
-    auto prompt = common_chat_template_direct_apply(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    auto prompt = common_chat_template_direct_apply_full(tmpl, inputs, /* messages_override= */ adjusted_messages, std::nullopt, std::nullopt);
 
     // Check if we need to replace the return token with end token during
     // inference and without generation prompt. For more details see:
@@ -1073,7 +1079,7 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_GEMMA4;
     data.supports_thinking = true;
 
